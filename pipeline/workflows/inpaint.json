@@ -1,0 +1,66 @@
+{
+  "description": "Inpainting workflow. Uses SetLatentNoiseMask for standard inpainting. Upload the image and a mask image, then replace __IMAGE__ and __MASK__.",
+  "nodes": {
+    "1": {
+      "class_type": "LoadImage",
+      "inputs": { "image": "__IMAGE__" }
+    },
+    "2": {
+      "class_type": "LoadImage",
+      "inputs": { "image": "__MASK__" }
+    },
+    "3": {
+      "class_type": "VAEEncode",
+      "inputs": { "pixels": ["1", 0], "vae": ["7", 2] }
+    },
+    "4": {
+      "class_type": "ImageToMask",
+      "inputs": { "image": ["2", 0], "channel": "red" }
+    },
+    "5": {
+      "class_type": "SetLatentNoiseMask",
+      "inputs": { "samples": ["3", 0], "mask": ["4", 0] }
+    },
+    "6": {
+      "class_type": "KSampler",
+      "inputs": {
+        "seed": 42,
+        "steps": 20,
+        "cfg": 7.0,
+        "sampler_name": "euler",
+        "scheduler": "normal",
+        "denoise": "__DENOISE__",
+        "model": ["7", 0],
+        "positive": ["8", 0],
+        "negative": ["9", 0],
+        "latent_image": ["5", 0]
+      }
+    },
+    "7": {
+      "class_type": "CheckpointLoaderSimple",
+      "inputs": { "ckpt_name": "__CHECKPOINT__" }
+    },
+    "8": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": "high quality photo, detailed, natural, photorealistic, clean",
+        "clip": ["7", 1]
+      }
+    },
+    "9": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": "blurry, low quality, distorted, deformed, bad anatomy, oversaturated, cartoon, painting",
+        "clip": ["7", 1]
+      }
+    },
+    "10": {
+      "class_type": "VAEDecode",
+      "inputs": { "samples": ["6", 0], "vae": ["7", 2] }
+    },
+    "11": {
+      "class_type": "SaveImage",
+      "inputs": { "images": ["10", 0], "filename_prefix": "inpainted" }
+    }
+  }
+}
