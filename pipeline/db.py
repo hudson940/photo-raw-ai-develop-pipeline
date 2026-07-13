@@ -90,6 +90,25 @@ def record_failure(
     return state
 
 
+def requeue(conn: sqlite3.Connection, states: tuple[str, ...] = ("previewed",),
+            clear_analysis: bool = False) -> int:
+    """Reset photos in the given states back to 'pending' (ready now) so the worker
+    reprocesses them. Defaults to 'previewed' rows left stuck by an interrupted run.
+
+    With clear_analysis=True, also wipe the cached analysis so the worker re-runs the
+    AI vision analysis from scratch instead of reusing the stored parameters.
+    """
+    placeholders = ",".join("?" * len(states))
+    extra = ", analysis_json=NULL, confidence=NULL" if clear_analysis else ""
+    with conn:
+        cur = conn.execute(
+            f"UPDATE photos SET state='pending', next_attempt_at=0, updated_at=?{extra} "
+            f"WHERE state IN ({placeholders})",
+            (time.time(), *states),
+        )
+    return cur.rowcount
+
+
 def counts_by_state(conn: sqlite3.Connection) -> dict[str, int]:
     rows = conn.execute("SELECT state, COUNT(*) AS n FROM photos GROUP BY state").fetchall()
     return {r["state"]: r["n"] for r in rows}

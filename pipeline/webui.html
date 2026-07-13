@@ -1,0 +1,1089 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PhotoRAW — review &amp; redo</title>
+<style>
+  :root{
+    --bg:#101216; --panel:#181b21; --panel2:#1f232b; --line:#2a2f39;
+    --text:#e8eaf0; --dim:#9aa3b2; --accent:#4f8cff; --accent2:#2f6ae0;
+    --ok:#3ecf8e; --warn:#f0b429; --err:#ef5350;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--text);font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif}
+  button{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);
+         border-radius:8px;padding:6px 12px;cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  button.primary:disabled{opacity:.45;cursor:not-allowed}
+  button.ghost{background:transparent}
+  input,select,textarea{font:inherit;color:var(--text);background:var(--panel2);
+    border:1px solid var(--line);border-radius:6px;padding:5px 8px}
+  input[type=range]{padding:0;accent-color:var(--accent)}
+  input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px}
+
+  /* ---------- header ---------- */
+  header{position:sticky;top:0;z-index:20;display:flex;flex-wrap:wrap;gap:10px;align-items:center;
+         padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+  header h1{font-size:16px;margin:0 8px 0 0;white-space:nowrap}
+  header h1 span{color:var(--accent)}
+  .chips{display:flex;gap:6px;flex-wrap:wrap}
+  .chip{padding:4px 10px;border-radius:999px;border:1px solid var(--line);cursor:pointer;
+        color:var(--dim);font-size:12.5px;user-select:none}
+  .chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  #search{width:170px}
+  .spacer{flex:1}
+  #selinfo{color:var(--dim);font-size:13px;white-space:nowrap}
+
+  /* ---------- grid ---------- */
+  main{padding:14px 16px 90px;display:grid;gap:12px;
+       grid-template-columns:repeat(auto-fill,minmax(215px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;
+        position:relative;transition:outline-color .1s;outline:2px solid transparent}
+  .card.sel{outline-color:var(--accent);border-color:var(--accent)}
+  .card .imgwrap{aspect-ratio:3/2;background:#0a0b0e;cursor:zoom-in;display:flex;
+                 align-items:center;justify-content:center;overflow:hidden}
+  .card img{width:100%;height:100%;object-fit:cover;display:block}
+  .card .noimg{color:var(--dim);font-size:12px}
+  .card .meta{display:flex;gap:6px;align-items:center;padding:7px 9px;font-size:12.5px}
+  .card .meta .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .card .id{color:var(--dim)}
+  .badge{font-size:10.5px;padding:2px 7px;border-radius:999px;border:1px solid var(--line);
+         color:var(--dim);text-transform:uppercase;letter-spacing:.4px}
+  .badge.done{color:var(--ok);border-color:var(--ok)}
+  .badge.failed,.badge.review{color:var(--err);border-color:var(--err)}
+  .badge.pending,.badge.previewed,.badge.analyzed{color:var(--warn);border-color:var(--warn)}
+  .card .ck{position:absolute;top:8px;left:8px;z-index:2;width:20px;height:20px;
+            accent-color:var(--accent);cursor:pointer;filter:drop-shadow(0 0 3px rgba(0,0,0,.9))}
+  #empty{grid-column:1/-1;color:var(--dim);text-align:center;padding:60px 0}
+
+  /* ---------- overlays ---------- */
+  .overlay{position:fixed;inset:0;background:rgba(5,6,9,.82);z-index:50;display:flex;
+           align-items:center;justify-content:center;padding:20px}
+  .hidden{display:none !important}
+
+  /* ---------- lightbox ---------- */
+  #lb .box{display:flex;flex-direction:column;max-width:96vw;max-height:94vh;gap:8px}
+  #lb .bar{display:flex;gap:8px;align-items:center;color:var(--dim)}
+  #lb .bar b{color:var(--text)}
+  #lb .body{display:flex;gap:10px;min-height:0}
+  #lbwrap{overflow:hidden;border-radius:8px;background:#000}
+  #lb img{max-width:78vw;max-height:82vh;object-fit:contain;background:#000;
+          transform-origin:center center;display:block}
+  #lbwrap.grab{cursor:grab}
+  #lbwrap.grabbing{cursor:grabbing}
+  .zoomgrp{display:flex;align-items:center;gap:2px}
+  .zoomgrp button{padding:4px 9px;font-weight:600}
+  #lbzlabel{min-width:44px;text-align:center;font-variant-numeric:tabular-nums;font-size:12.5px}
+  /* crop overlay */
+  #cropov{position:absolute;inset:0;z-index:3;touch-action:none}
+  #cropbox{position:absolute;border:1px solid #fff;box-shadow:0 0 0 9999px rgba(0,0,0,.55);
+           cursor:move}
+  #cropbox::before,#cropbox::after,#cropbox .v1,#cropbox .v2{content:"";position:absolute;
+           background:rgba(255,255,255,.35)}
+  #cropbox::before{left:33.33%;top:0;bottom:0;width:1px}
+  #cropbox::after{left:66.66%;top:0;bottom:0;width:1px}
+  #cropbox .v1{top:33.33%;left:0;right:0;height:1px}
+  #cropbox .v2{top:66.66%;left:0;right:0;height:1px}
+  .chandle{position:absolute;width:16px;height:16px;background:#fff;border-radius:50%;
+           box-shadow:0 0 0 1px var(--accent)}
+  .chandle.nw{left:-8px;top:-8px;cursor:nwse-resize}
+  .chandle.ne{right:-8px;top:-8px;cursor:nesw-resize}
+  .chandle.sw{left:-8px;bottom:-8px;cursor:nesw-resize}
+  .chandle.se{right:-8px;bottom:-8px;cursor:nwse-resize}
+  #lb aside{width:340px;max-height:82vh;overflow:auto;background:var(--panel);
+            border:1px solid var(--line);border-radius:8px;padding:10px;font-size:12px}
+  #lb aside pre{white-space:pre-wrap;word-break:break-word;color:var(--dim);margin:6px 0}
+  #erasebar{display:flex;gap:10px;align-items:center;background:var(--panel);
+            border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-size:13px;
+            flex-wrap:wrap}
+
+  /* ---------- wizard ---------- */
+  #wiz .box{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+            width:min(880px,96vw);max-height:92vh;display:flex;flex-direction:column}
+  #wiz .head{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--line)}
+  #wiz .head h2{margin:0;font-size:15px}
+  #wiz .head .n{color:var(--dim);font-size:13px}
+  #wiz .tabs{display:flex;gap:4px;padding:10px 18px 0;flex-wrap:wrap}
+  #wiz .tab{padding:6px 12px;border-radius:8px 8px 0 0;border:1px solid var(--line);
+            border-bottom:none;color:var(--dim);cursor:pointer;font-size:13px}
+  #wiz .tab.on{background:var(--panel2);color:var(--text);border-color:var(--accent)}
+  #wiz .tab .dot{display:inline-block;width:7px;height:7px;border-radius:50%;
+                 background:var(--accent);margin-left:6px;vertical-align:1px}
+  #wiz .body{flex:1;overflow:auto;padding:14px 18px;background:var(--panel2);min-height:300px}
+  #wiz .foot{display:flex;gap:8px;align-items:center;padding:12px 18px;border-top:1px solid var(--line)}
+  .prow{display:grid;grid-template-columns:24px 190px 1fr 130px;gap:10px;align-items:center;
+        padding:7px 6px;border-radius:8px}
+  .prow:hover{background:rgba(255,255,255,.025)}
+  .prow.off .plabel,.prow.off .cur{opacity:.45}
+  .prow .plabel{font-size:13px}
+  .prow .cur{font-size:11.5px;color:var(--dim);text-align:right}
+  .prow output{font-variant-numeric:tabular-nums;color:var(--accent);min-width:44px;
+               display:inline-block;text-align:right;font-size:12.5px}
+  .prow .ctl{display:flex;gap:8px;align-items:center}
+  .prow input[type=range]{flex:1}
+  .prow select,.prow input[type=number],.prow input[type=text]{width:100%}
+  .sect{margin:14px 0 4px;color:var(--dim);font-size:11.5px;text-transform:uppercase;
+        letter-spacing:.8px}
+  .hint{color:var(--dim);font-size:12px;margin:4px 6px 10px}
+  #review .item{padding:4px 0;font-size:13px}
+  #review code,#lb code{display:block;background:#0b0d11;border:1px solid var(--line);
+    border-radius:8px;padding:10px;font:12px/1.5 ui-monospace,monospace;white-space:pre-wrap;
+    word-break:break-word;color:#c8d3f5;margin:8px 0}
+  .optrow{display:flex;gap:18px;margin:12px 6px;color:var(--dim);align-items:center}
+  .optrow label{display:flex;gap:7px;align-items:center;cursor:pointer}
+
+  /* ---------- jobs drawer ---------- */
+  #jobsbtn .live{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);
+                 margin-left:6px;animation:pulse 1.2s infinite}
+  @keyframes pulse{50%{opacity:.3}}
+  #jobs{position:fixed;right:14px;bottom:14px;width:min(420px,94vw);max-height:60vh;z-index:40;
+        background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:auto;
+        box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  #jobs .jhead{display:flex;align-items:center;padding:10px 14px;border-bottom:1px solid var(--line);
+               position:sticky;top:0;background:var(--panel)}
+  .job{padding:10px 14px;border-bottom:1px solid var(--line)}
+  .job .row1{display:flex;gap:8px;align-items:center;font-size:13px}
+  .job .bar{height:5px;background:var(--panel2);border-radius:4px;margin:8px 0;overflow:hidden}
+  .job .bar i{display:block;height:100%;background:var(--accent);transition:width .4s}
+  .job .items{display:flex;flex-wrap:wrap;gap:5px}
+  .pill{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--dim)}
+  .pill.running{color:var(--accent);border-color:var(--accent)}
+  .pill.done{color:var(--ok);border-color:var(--ok)}
+  .pill.error{color:var(--err);border-color:var(--err)}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Photo<span>RAW</span> review</h1>
+  <div class="chips" id="chips"></div>
+  <input id="search" type="search" placeholder="filename or #id…">
+  <div class="spacer"></div>
+  <span id="selinfo">0 selected</span>
+  <button id="selall" class="ghost">Select all</button>
+  <button id="selnone" class="ghost">Clear</button>
+  <button id="jobsbtn">Jobs</button>
+  <button id="redobtn" class="primary" disabled>Redo selected…</button>
+</header>
+
+<main id="grid"></main>
+
+<!-- lightbox -->
+<div id="lb" class="overlay hidden">
+  <div class="box">
+    <div class="bar">
+      <b id="lbname"></b><span id="lbstate" class="badge"></span>
+      <span class="spacer"></span>
+      <label style="display:flex;gap:6px;align-items:center;cursor:pointer">
+        <input type="checkbox" id="lbsel"> selected</label>
+      <span class="zoomgrp"><button id="lbzout" title="zoom out">−</button>
+        <span id="lbzlabel">100%</span><button id="lbzin" title="zoom in">+</button>
+        <button id="lbzfit" title="fit">Fit</button></span>
+      <button id="lborig">Original preview</button>
+      <button id="lbcrop">Crop</button>
+      <button id="lberase">Erase objects</button>
+      <button id="lbparams">Params</button>
+      <button id="lbredo" class="primary">Redo this…</button>
+      <button id="lbprev">←</button><button id="lbnext">→</button>
+      <button id="lbclose">✕</button>
+    </div>
+    <div id="cropbar" class="hidden" style="display:flex;gap:10px;align-items:center;
+         background:var(--panel);border:1px solid var(--line);border-radius:8px;
+         padding:8px 12px;font-size:13px;flex-wrap:wrap">
+      <span style="color:var(--dim)">Drag the box; corners resize. Cropping re-develops the RAW.</span>
+      <label>ratio
+        <select id="cropratio">
+          <option value="free">free</option>
+          <option value="1">1:1</option>
+          <option value="0.8">4:5</option>
+          <option value="0.714">5:7</option>
+          <option value="1.5">3:2</option>
+          <option value="0.667">2:3</option>
+          <option value="1.778">16:9</option>
+        </select></label>
+      <span class="spacer"></span>
+      <button id="cropreset">Reset</button>
+      <button id="cropcancel">Cancel</button>
+      <button id="cropapply" class="primary">Apply crop &amp; render</button>
+    </div>
+    <div id="erasebar" class="hidden">
+      <span style="color:var(--dim)">Paint over what should disappear</span>
+      <label>brush <input type="range" id="ebrush" min="6" max="90" value="30"
+             style="width:90px;vertical-align:middle"></label>
+      <button id="eundo">Undo</button>
+      <button id="eclear">Clear</button>
+      <select id="emethod" title="fill method">
+        <option value="content-aware">Content-Aware Fill (fast)</option>
+        <option value="generative">Generative Fill (ComfyUI)</option>
+      </select>
+      <input type="text" id="eprompt" class="hidden" placeholder="what to paint instead (optional)"
+             style="width:210px">
+      <button id="edrop" class="hidden">Delete saved mask</button>
+      <span class="spacer"></span>
+      <button id="ecancel">Cancel</button>
+      <button id="eapply" class="primary">Remove &amp; render</button>
+    </div>
+    <div class="body">
+      <div id="lbwrap" style="position:relative;line-height:0">
+        <img id="lbimg" alt="">
+        <canvas id="ecanvas" class="hidden"
+          style="position:absolute;inset:0;cursor:crosshair;touch-action:none"></canvas>
+        <div id="cropov" class="hidden">
+          <div id="cropbox"><span class="v1"></span><span class="v2"></span>
+            <span class="chandle nw"></span><span class="chandle ne"></span>
+            <span class="chandle sw"></span><span class="chandle se"></span></div>
+        </div>
+      </div>
+      <aside id="lbaside" class="hidden"></aside>
+    </div>
+  </div>
+</div>
+
+<!-- wizard -->
+<div id="wiz" class="overlay hidden">
+  <div class="box">
+    <div class="head">
+      <h2>Redo wizard</h2><span class="n" id="wizn"></span>
+      <span class="spacer"></span><button id="wizclose" class="ghost">✕</button>
+    </div>
+    <div class="tabs" id="wiztabs"></div>
+    <div class="body" id="wizbody"></div>
+    <div class="foot">
+      <span class="n" id="wizmsg" style="color:var(--dim);font-size:12.5px"></span>
+      <span class="spacer"></span>
+      <button id="wizback">Back</button>
+      <button id="wiznext" class="primary">Next</button>
+      <button id="wizrun" class="primary hidden">Run batch</button>
+    </div>
+  </div>
+</div>
+
+<!-- jobs drawer -->
+<div id="jobs" class="hidden">
+  <div class="jhead"><b>Render jobs</b><span class="spacer"></span>
+    <button id="jobsclose" class="ghost">✕</button></div>
+  <div id="jobslist"></div>
+</div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const state = {
+  photos: [], selected: new Set(), filter: "all", search: "",
+  jobs: [], lbId: null, lbOrig: false, lastClickIdx: null,
+  wizStep: 0, detail: null, defaults: null,
+};
+
+/* ================= parameter model (drives the wizard) ================= */
+const SKIN_TYPES = ["auto","fair","light","medium","olive","tan","brown","deep"];
+const BG_COLORS = ["gray","white","black","charcoal","blue","navy","teal","green",
+                   "red","maroon","pink","purple","beige","brown"];
+const STEPS = [
+ {title:"Skin", hint:"Tone correction targets natural best-practice color per skin type. "+
+   "Warmth/richness/red ride on tone correction (enabling them auto-activates it).",
+  params:[
+   {g:"retouch",k:"skin_smoothing",label:"Skin smoothing",min:0,max:1,step:0.05},
+   {g:"retouch",k:"remove_blemishes",label:"Remove blemishes",type:"bool"},
+   {g:"retouch",k:"skin_tone_correction",label:"Tone correction",min:0,max:1,step:0.05},
+   {g:"retouch",k:"skin_type",label:"Skin type",type:"select",options:SKIN_TYPES},
+   {g:"retouch",k:"skin_warmth",label:"Warmth (yellow ↔ orange)",min:-1,max:1,step:0.05},
+   {g:"retouch",k:"skin_saturation",label:"Richness / saturation",min:0.5,max:1.8,step:0.05},
+   {g:"retouch",k:"skin_luminance",label:"Skin luminance",min:0,max:1,step:0.05},
+   {g:"retouch",k:"skin_red",label:"Red flush (cheeks)",min:0,max:1,step:0.05},
+ ]},
+ {title:"Face", params:[
+   {g:"retouch",k:"brighten_eyes",label:"Brighten eyes (sclera)",min:0,max:1,step:0.05},
+   {g:"retouch",k:"iris_enhance",label:"Iris pop",min:0,max:1,step:0.05},
+   {g:"retouch",k:"whiten_teeth",label:"Whiten teeth",min:0,max:1,step:0.05},
+   {g:"retouch",k:"lip_enhance",label:"Lip enhancement",min:0,max:1,step:0.05},
+   {g:"retouch",k:"reduce_dark_circles",label:"Dark circles",min:0,max:1,step:0.05},
+   {g:"retouch",k:"reduce_dewlap",label:"Dewlap / double chin",min:0,max:1,step:0.05},
+   {g:"retouch",k:"tame_highlights",label:"Tame shiny highlights",min:0,max:1,step:0.05},
+ ]},
+ {title:"Hair & clothing", params:[
+   {sect:"Hair"},
+   {g:"retouch",k:"hair_texture",label:"Hair texture & clarity",min:0,max:1,step:0.05},
+   {g:"retouch",k:"hair_shimmer",label:"Hair shimmer",min:0,max:1,step:0.05},
+   {g:"retouch",k:"hair_defrizz",label:"Defrizz / flyaways",min:0,max:1,step:0.05},
+   {sect:"Clothing"},
+   {g:"retouch",k:"clothing_contrast",label:"Clothing contrast",min:0,max:1,step:0.05},
+   {g:"clothing",k:"color",label:"Cloth color",type:"text",ph:"red, navy, white…"},
+   {g:"clothing",k:"color_pop",label:"Color pop",min:0,max:1,step:0.05},
+   {g:"clothing",k:"luminance",label:"Cloth luminance",min:-1,max:1,step:0.05},
+   {g:"clothing",k:"shadows",label:"Cloth shadows",min:-1,max:1,step:0.05},
+   {g:"clothing",k:"blacks",label:"Cloth blacks",min:-1,max:1,step:0.05},
+   {g:"clothing",k:"whites",label:"Cloth whites",min:-1,max:1,step:0.05},
+ ]},
+ {title:"Light & develop",
+  hint:"White balance, shadows and highlights re-develop the RAW automatically. "+
+   "Auto-levels meters skin / subject / background toward their targets (deterministic).",
+  params:[
+   {special:"wb"},
+   {g:"develop",k:"shadows",label:"Shadows (global)",min:-100,max:100,step:1},
+   {g:"develop",k:"highlights",label:"Highlights (global)",min:-100,max:100,step:1},
+   {g:"retouch",k:"subject_exposure",label:"Subject exposure (EV)",min:-2,max:2,step:0.1},
+   {g:"retouch",k:"background_exposure",label:"Background exposure (EV)",min:-2,max:2,step:0.1},
+   {sect:"Auto-levels"},
+   {g:"retouch",k:"auto_levels",label:"Enable auto-levels",type:"bool"},
+   {g:"retouch",k:"auto_skin_target",label:"Skin target",min:0,max:1,step:0.01},
+   {g:"retouch",k:"auto_subject_target",label:"Subject target",min:0,max:1,step:0.01},
+   {g:"retouch",k:"auto_background_target",label:"Background target",min:0,max:1,step:0.01},
+   {sect:"Overall"},
+   {g:"retouch",k:"intensity",label:"Retouch intensity",type:"select",
+    options:["subtle","natural","polished"]},
+ ]},
+ {title:"Background",
+  hint:"Background only changes when you explicitly set it here — otherwise it is kept.",
+  params:[
+   {g:"background",k:"action",label:"Action",type:"select",
+    options:["auto","keep","blur","smooth","studio","replace"]},
+   {g:"background",k:"color",label:"Studio color",type:"select",options:BG_COLORS,
+    showIf:(ov)=>ov==="studio"},
+   {g:"background",k:"replace_prompt",label:"Replace prompt",type:"text",
+    ph:"soft window light, bright interior…",showIf:(ov)=>ov==="replace"},
+ ]},
+ {title:"Review", review:true},
+];
+
+// key -> CLI flag, for the reproduce-command preview
+const FLAGS = {
+ retouch:{skin_smoothing:"--skin",skin_tone_correction:"--skintone",skin_type:"--skin-type",
+  skin_warmth:"--skin-warmth",skin_saturation:"--skin-saturation",
+  skin_luminance:"--skin-luminance",skin_red:"--skin-red",reduce_dark_circles:"--darkcircles",
+  reduce_dewlap:"--dewlap",brighten_eyes:"--eyes",iris_enhance:"--iris",whiten_teeth:"--teeth",
+  lip_enhance:"--lips",tame_highlights:"--tame-highlights",hair_texture:"--hair",
+  hair_shimmer:"--hair-shimmer",hair_defrizz:"--defrizz",clothing_contrast:"--clothing",
+  subject_exposure:"--subject-exposure",background_exposure:"--background-exposure",
+  auto_skin_target:"--skin-target",auto_subject_target:"--subject-target",
+  auto_background_target:"--background-target",intensity:"--intensity"},
+ clothing:{color:"--cloth-color",color_pop:"--cloth-pop",luminance:"--cloth-luminance",
+  shadows:"--cloth-shadows",blacks:"--cloth-blacks",whites:"--cloth-whites"},
+ develop:{shadows:"--shadows",highlights:"--highlights"},
+};
+
+/* ================= gallery ================= */
+async function loadPhotos(){
+  const r = await fetch("/api/photos"); const j = await r.json();
+  state.photos = j.photos;
+  renderChips(); renderGrid();
+}
+function visiblePhotos(){
+  const q = state.search.trim().toLowerCase();
+  return state.photos.filter(p=>{
+    if(state.filter!=="all" && p.state!==state.filter) return false;
+    if(q && !(p.filename.toLowerCase().includes(q) || ("#"+p.id).includes(q) ||
+              String(p.id)===q)) return false;
+    return true;
+  });
+}
+function renderChips(){
+  const counts = {all: state.photos.length};
+  for(const p of state.photos) counts[p.state]=(counts[p.state]||0)+1;
+  const order = ["all","done","retouched","developed","analyzed","previewed","pending","review","failed"];
+  $("#chips").innerHTML = order.filter(s=>counts[s]).map(s=>
+    `<span class="chip ${state.filter===s?"on":""}" data-f="${s}">${s} ${counts[s]||0}</span>`).join("");
+  $("#chips").querySelectorAll(".chip").forEach(c=>c.onclick=()=>{
+    state.filter=c.dataset.f; renderChips(); renderGrid();});
+}
+function renderGrid(){
+  const vis = visiblePhotos();
+  const grid = $("#grid");
+  if(!vis.length){ grid.innerHTML = `<div id="empty">No photos match.</div>`; updateSel(); return; }
+  grid.innerHTML = vis.map(p=>`
+    <div class="card ${state.selected.has(p.id)?"sel":""}" data-id="${p.id}">
+      <input type="checkbox" class="ck" ${state.selected.has(p.id)?"checked":""}>
+      <div class="imgwrap">${p.has_output||p.has_preview
+        ? `<img loading="lazy" src="/thumb/${p.id}?v=${p.output_mtime}" alt="">`
+        : `<span class="noimg">no image yet</span>`}</div>
+      <div class="meta">
+        <span class="id">#${p.id}</span>
+        <span class="name" title="${p.scene||p.filename}">${p.filename}</span>
+        ${p.is_portrait?`<span title="portrait">👤</span>`:""}
+        <span class="badge ${p.state}">${p.state}</span>
+      </div>
+    </div>`).join("");
+  grid.querySelectorAll(".card").forEach(card=>{
+    const id = +card.dataset.id;
+    card.querySelector(".ck").addEventListener("click",e=>{
+      e.stopPropagation(); toggleSel(id, e.shiftKey, vis);
+    });
+    card.querySelector(".imgwrap").addEventListener("click",()=>openLightbox(id));
+  });
+  updateSel();
+}
+function toggleSel(id, shift, vis){
+  const idx = vis.findIndex(p=>p.id===id);
+  if(shift && state.lastClickIdx!==null){
+    const [a,b]=[Math.min(idx,state.lastClickIdx),Math.max(idx,state.lastClickIdx)];
+    const target = !state.selected.has(id);
+    for(let i=a;i<=b;i++) target?state.selected.add(vis[i].id):state.selected.delete(vis[i].id);
+  } else {
+    state.selected.has(id)?state.selected.delete(id):state.selected.add(id);
+  }
+  state.lastClickIdx = idx;
+  renderGrid();
+}
+function updateSel(){
+  const n = state.selected.size;
+  $("#selinfo").textContent = `${n} selected`;
+  $("#redobtn").disabled = !n;
+  $("#redobtn").textContent = n>1?`Redo ${n} photos…`:"Redo selected…";
+}
+$("#selall").onclick = ()=>{ visiblePhotos().forEach(p=>state.selected.add(p.id)); renderGrid(); };
+$("#selnone").onclick = ()=>{ state.selected.clear(); renderGrid(); };
+$("#search").oninput = e=>{ state.search=e.target.value; renderGrid(); };
+
+/* ================= lightbox ================= */
+function openLightbox(id){
+  state.lbId = id; state.lbOrig = false;
+  $("#lb").classList.remove("hidden");
+  $("#lbaside").classList.add("hidden");
+  exitErase(); exitCrop(); resetZoom();
+  refreshLightbox();
+}
+function refreshLightbox(){
+  const p = state.photos.find(x=>x.id===state.lbId); if(!p) return;
+  $("#lbname").textContent = `#${p.id} ${p.filename}`;
+  $("#lbstate").textContent = p.state; $("#lbstate").className = `badge ${p.state}`;
+  $("#lbsel").checked = state.selected.has(p.id);
+  $("#lborig").style.display = p.has_preview && p.has_output ? "" : "none";
+  $("#lborig").textContent = state.lbOrig ? "Latest render" : "Original preview";
+  const q = new URLSearchParams({t: p.output_mtime});
+  if(state.lbOrig) q.set("src","preview");
+  $("#lbimg").src = `/img/${p.id}?${q}`;
+}
+function lbStep(d){
+  const vis = visiblePhotos(); if(!vis.length) return;
+  exitErase(); exitCrop(); resetZoom();
+  let i = vis.findIndex(p=>p.id===state.lbId);
+  i = (i+d+vis.length)%vis.length; state.lbId = vis[i].id; state.lbOrig=false;
+  $("#lbaside").classList.add("hidden"); refreshLightbox();
+}
+$("#lbclose").onclick = ()=>{ exitErase(); exitCrop(); $("#lb").classList.add("hidden"); };
+$("#lbprev").onclick = ()=>lbStep(-1);
+$("#lbnext").onclick = ()=>lbStep(1);
+$("#lborig").onclick = ()=>{ state.lbOrig=!state.lbOrig; refreshLightbox(); };
+$("#lbsel").onclick = e=>{ e.target.checked?state.selected.add(state.lbId)
+                                            :state.selected.delete(state.lbId); renderGrid(); };
+$("#lbparams").onclick = async ()=>{
+  const aside = $("#lbaside");
+  if(!aside.classList.contains("hidden")){ aside.classList.add("hidden"); return; }
+  const d = await (await fetch(`/api/photos/${state.lbId}`)).json();
+  aside.innerHTML = d.has_analysis
+    ? `<b>Scene</b><pre>${esc(d.scene||"—")}</pre>
+       <b>Reproduce</b><code>${esc(d.command||"")}</code>
+       <b>Develop</b><pre>${esc(JSON.stringify(d.develop,null,1))}</pre>
+       <b>Retouch</b><pre>${esc(JSON.stringify(d.retouch,null,1))}</pre>`
+    : `<pre>No analysis yet (state: ${esc(d.state)})</pre>`;
+  aside.classList.remove("hidden");
+};
+
+/* ================= erase editor ================= */
+const er = {active:false, strokes:[], drawing:null, hasSaved:false};
+const ecv = $("#ecanvas");
+function enterErase(){
+  const img = $("#lbimg");
+  if(!img.complete){ img.onload = enterErase; return; }
+  exitCrop(); resetZoom();
+  er.active = true; er.strokes = [];
+  state.lbOrig = false;
+  $("#erasebar").classList.remove("hidden");
+  ecv.classList.remove("hidden");
+  $("#lbaside").classList.add("hidden");
+  syncCanvas();
+  // does this photo already have a saved erase mask? (offer to delete it)
+  fetch(`/api/photos/${state.lbId}`).then(r=>r.json()).then(d=>{
+    er.hasSaved = !!(d.retouch && d.retouch.erase && d.retouch.erase.mask);
+    $("#edrop").classList.toggle("hidden", !er.hasSaved);
+  });
+}
+function exitErase(){
+  er.active = false; er.strokes = [];
+  $("#erasebar").classList.add("hidden");
+  ecv.classList.add("hidden");
+}
+function syncCanvas(){
+  const img = $("#lbimg");
+  ecv.width = img.clientWidth; ecv.height = img.clientHeight;
+  redrawErase();
+}
+function redrawErase(){
+  const ctx = ecv.getContext("2d");
+  ctx.clearRect(0,0,ecv.width,ecv.height);
+  paintStrokes(ctx, ecv.width, ecv.height, "rgba(255,64,64,0.55)");
+}
+function paintStrokes(ctx, w, h, color){
+  for(const s of er.strokes){
+    ctx.strokeStyle = ctx.fillStyle = color;
+    ctx.lineWidth = s.size * w;   // size stored relative to width
+    ctx.lineCap = ctx.lineJoin = "round";
+    ctx.beginPath();
+    s.pts.forEach(([x,y],i)=> i?ctx.lineTo(x*w,y*h):ctx.moveTo(x*w,y*h));
+    if(s.pts.length===1){ ctx.arc(s.pts[0][0]*w, s.pts[0][1]*h, ctx.lineWidth/2, 0, 7); ctx.fill(); }
+    else ctx.stroke();
+  }
+}
+function erasePoint(e){
+  const r = ecv.getBoundingClientRect();
+  return [(e.clientX-r.left)/r.width, (e.clientY-r.top)/r.height];
+}
+ecv.addEventListener("pointerdown",e=>{
+  e.preventDefault(); ecv.setPointerCapture(e.pointerId);
+  er.drawing = {pts:[erasePoint(e)], size:+$("#ebrush").value/ecv.width};
+  er.strokes.push(er.drawing); redrawErase();
+});
+ecv.addEventListener("pointermove",e=>{
+  if(!er.drawing) return;
+  er.drawing.pts.push(erasePoint(e)); redrawErase();
+});
+ecv.addEventListener("pointerup",()=>{ er.drawing = null; });
+window.addEventListener("resize",()=>{ if(er.active) syncCanvas(); });
+$("#lberase").onclick = ()=> er.active ? exitErase() : enterErase();
+$("#ecancel").onclick = exitErase;
+$("#eundo").onclick = ()=>{ er.strokes.pop(); redrawErase(); };
+$("#eclear").onclick = ()=>{ er.strokes = []; redrawErase(); };
+$("#emethod").onchange = ()=>
+  $("#eprompt").classList.toggle("hidden", $("#emethod").value!=="generative");
+function exportEraseMask(){
+  // white strokes on black, at the render's real proportions (cap 1600 long edge)
+  const img = $("#lbimg");
+  const nw = img.naturalWidth||ecv.width, nh = img.naturalHeight||ecv.height;
+  const scale = Math.min(1, 1600/Math.max(nw,nh));
+  const c = document.createElement("canvas");
+  c.width = Math.round(nw*scale); c.height = Math.round(nh*scale);
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#000"; ctx.fillRect(0,0,c.width,c.height);
+  paintStrokes(ctx, c.width, c.height, "#fff");
+  return c.toDataURL("image/png");
+}
+$("#eapply").onclick = async ()=>{
+  if(!er.strokes.length){ alert("Paint over the parts to remove first."); return; }
+  $("#eapply").disabled = true;
+  try{
+    const r = await fetch(`/api/photos/${state.lbId}/erase`,{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({mask: exportEraseMask(), method: $("#emethod").value,
+                           prompt: $("#eprompt").value.trim()})});
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.error||r.status);
+    exitErase(); openJobs(); pollJobs(true);
+  }catch(e){ alert("Erase failed: "+e.message); }
+  finally{ $("#eapply").disabled = false; }
+};
+$("#edrop").onclick = async ()=>{
+  if(!confirm("Delete this photo's saved erase mask and re-render?")) return;
+  await fetch(`/api/photos/${state.lbId}/erase`,{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify({clear:true})});
+  exitErase(); openJobs(); pollJobs(true);
+};
+
+/* ================= zoom & pan ================= */
+const clamp = (v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+const zoom = {scale:1, tx:0, ty:0};
+const lbwrap = $("#lbwrap");
+function applyZoom(){
+  $("#lbimg").style.transform = `translate(${zoom.tx}px,${zoom.ty}px) scale(${zoom.scale})`;
+  $("#lbzlabel").textContent = Math.round(zoom.scale*100)+"%";
+  lbwrap.classList.toggle("grab", zoom.scale>1 && !er.active && !crop.active);
+}
+function resetZoom(){ zoom.scale=1; zoom.tx=0; zoom.ty=0; applyZoom(); }
+function clampPan(){
+  const img=$("#lbimg");
+  const mx=Math.max(0,(zoom.scale-1)*img.clientWidth/2);
+  const my=Math.max(0,(zoom.scale-1)*img.clientHeight/2);
+  zoom.tx=clamp(zoom.tx,-mx,mx); zoom.ty=clamp(zoom.ty,-my,my);
+}
+function zoomAt(factor, clientX, clientY){
+  if(er.active || crop.active) return;
+  const wr=lbwrap.getBoundingClientRect();
+  const cx=wr.left+wr.width/2, cy=wr.top+wr.height/2;
+  const px=(clientX==null?cx:clientX)-cx, py=(clientY==null?cy:clientY)-cy;
+  const s0=zoom.scale, s1=clamp(s0*factor,1,6);
+  if(s1===s0) return;
+  zoom.tx = px-(s1/s0)*(px-zoom.tx);
+  zoom.ty = py-(s1/s0)*(py-zoom.ty);
+  zoom.scale=s1;
+  if(s1===1){ zoom.tx=0; zoom.ty=0; }
+  clampPan(); applyZoom();
+}
+$("#lbzin").onclick  = ()=> zoomAt(1.3);
+$("#lbzout").onclick = ()=> zoomAt(1/1.3);
+$("#lbzfit").onclick = resetZoom;
+lbwrap.addEventListener("wheel", e=>{
+  if(er.active || crop.active) return;
+  e.preventDefault(); zoomAt(e.deltaY<0?1.15:1/1.15, e.clientX, e.clientY);
+}, {passive:false});
+let panning=null;
+lbwrap.addEventListener("pointerdown", e=>{
+  if(er.active || crop.active || zoom.scale<=1) return;
+  panning={x:e.clientX,y:e.clientY}; lbwrap.classList.add("grabbing");
+  lbwrap.setPointerCapture(e.pointerId);
+});
+lbwrap.addEventListener("pointermove", e=>{
+  if(!panning) return;
+  zoom.tx+=e.clientX-panning.x; zoom.ty+=e.clientY-panning.y;
+  panning={x:e.clientX,y:e.clientY}; clampPan(); applyZoom();
+});
+lbwrap.addEventListener("pointerup", ()=>{ panning=null; lbwrap.classList.remove("grabbing"); });
+$("#lbimg").addEventListener("dblclick", e=>{
+  if(er.active || crop.active) return;
+  zoom.scale>1 ? resetZoom() : zoomAt(2.5, e.clientX, e.clientY);
+});
+
+/* ================= crop ================= */
+const crop = {active:false, box:null, ratio:"free"};
+const cropov = $("#cropov"), cropbox = $("#cropbox");
+function enterCrop(){
+  exitErase(); resetZoom();
+  const p = state.photos.find(x=>x.id===state.lbId);
+  state.lbOrig = !!(p && p.has_preview);   // crop on the full-frame preview when available
+  refreshLightbox();
+  crop.active = true; crop.ratio = "free"; $("#cropratio").value = "free";
+  $("#cropbar").classList.remove("hidden");
+  cropov.classList.remove("hidden");
+  $("#lbaside").classList.add("hidden");
+  const img = $("#lbimg");
+  if(img.complete && img.naturalWidth) initCropBox();
+  else img.addEventListener("load", initCropBox, {once:true});
+}
+function exitCrop(){
+  crop.active = false;
+  $("#cropbar") && $("#cropbar").classList.add("hidden");
+  cropov && cropov.classList.add("hidden");
+}
+function imgBox(){ const img=$("#lbimg"); return {w:img.clientWidth, h:img.clientHeight}; }
+function fitRatio(maxW,maxH,ratio){ let w=maxW,h=w/ratio; if(h>maxH){h=maxH;w=h*ratio;} return [w,h]; }
+function initCropBox(){
+  const {w,h}=imgBox();
+  let cw=w*0.8, ch=h*0.8;
+  if(crop.ratio!=="free") [cw,ch]=fitRatio(w*0.9,h*0.9,+crop.ratio);
+  crop.box={x:(w-cw)/2, y:(h-ch)/2, w:cw, h:ch};
+  drawCropBox();
+}
+function drawCropBox(){
+  const b=crop.box; if(!b) return;
+  cropbox.style.left=b.x+"px"; cropbox.style.top=b.y+"px";
+  cropbox.style.width=b.w+"px"; cropbox.style.height=b.h+"px";
+}
+function applyRatioCorner(b,mode,ratio,W,H){
+  const anchorX = mode.includes("w") ? b.x+b.w : b.x;
+  const anchorY = mode.includes("n") ? b.y+b.h : b.y;
+  let w=b.w, h=w/ratio;
+  h=Math.min(h, mode.includes("n")?anchorY:H-anchorY); w=h*ratio;
+  w=Math.min(w, mode.includes("w")?anchorX:W-anchorX); h=w/ratio;
+  return {x: mode.includes("w")?anchorX-w:anchorX, y: mode.includes("n")?anchorY-h:anchorY, w, h};
+}
+let cdrag=null;
+cropov.addEventListener("pointerdown", e=>{
+  const cls=[...e.target.classList];
+  const handle = e.target.classList.contains("chandle")
+    ? ["nw","ne","sw","se"].find(c=>cls.includes(c)) : null;
+  if(e.target!==cropbox && !handle) return;
+  e.preventDefault(); cropov.setPointerCapture(e.pointerId);
+  cdrag={mode:handle||"move", sx:e.clientX, sy:e.clientY, box0:{...crop.box}};
+});
+cropov.addEventListener("pointermove", e=>{
+  if(!cdrag) return;
+  const {w:W,h:H}=imgBox();
+  const dx=e.clientX-cdrag.sx, dy=e.clientY-cdrag.sy, o=cdrag.box0;
+  let b;
+  if(cdrag.mode==="move"){
+    b={x:clamp(o.x+dx,0,W-o.w), y:clamp(o.y+dy,0,H-o.h), w:o.w, h:o.h};
+  } else {
+    let x1=o.x, y1=o.y, x2=o.x+o.w, y2=o.y+o.h;
+    if(cdrag.mode.includes("w")) x1=clamp(o.x+dx,0,x2-20);
+    if(cdrag.mode.includes("e")) x2=clamp(o.x+o.w+dx,x1+20,W);
+    if(cdrag.mode.includes("n")) y1=clamp(o.y+dy,0,y2-20);
+    if(cdrag.mode.includes("s")) y2=clamp(o.y+o.h+dy,y1+20,H);
+    b={x:x1,y:y1,w:x2-x1,h:y2-y1};
+    if(crop.ratio!=="free") b=applyRatioCorner(b,cdrag.mode,+crop.ratio,W,H);
+  }
+  crop.box=b; drawCropBox();
+});
+cropov.addEventListener("pointerup", ()=>{ cdrag=null; });
+$("#cropratio").onchange = ()=>{ crop.ratio=$("#cropratio").value; initCropBox(); };
+$("#cropreset").onclick  = ()=>{ crop.ratio="free"; $("#cropratio").value="free"; initCropBox(); };
+$("#cropcancel").onclick = ()=>{ exitCrop(); state.lbOrig=false; refreshLightbox(); };
+$("#lbcrop").onclick = ()=> crop.active ? ($("#cropcancel").onclick()) : enterCrop();
+$("#cropapply").onclick = async ()=>{
+  if(!crop.box) return;
+  const {w:W,h:H}=imgBox(), b=crop.box;
+  const cropFrac={x:b.x/W, y:b.y/H, w:b.w/W, h:b.h/H};
+  $("#cropapply").disabled = true;
+  try{
+    const r = await fetch("/api/redo",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({ids:[state.lbId], overrides:{develop:{crop:cropFrac}}, from_raw:true})});
+    const j = await r.json(); if(!r.ok) throw new Error(j.error||r.status);
+    exitCrop(); state.lbOrig=false; openJobs(); pollJobs(true);
+  }catch(e){ alert("Crop failed: "+e.message); }
+  finally{ $("#cropapply").disabled = false; }
+};
+
+/* ================= redo this photo ================= */
+$("#lbredo").onclick = ()=>{
+  const id = state.lbId;
+  exitErase(); exitCrop();
+  state.selected = new Set([id]); renderGrid();
+  $("#lb").classList.add("hidden");
+  openWizard();
+};
+
+/* ================= wizard ================= */
+$("#redobtn").onclick = openWizard;
+async function openWizard(){
+  if(!state.selected.size) return;
+  state.wizStep = 0; state.detail = null;
+  if(!state.defaults) state.defaults = (await (await fetch("/api/defaults")).json()).retouch;
+  if(state.selected.size===1){
+    const id = [...state.selected][0];
+    const d = await (await fetch(`/api/photos/${id}`)).json();
+    if(d.has_analysis) state.detail = d;
+  }
+  const ids = [...state.selected].sort((a,b)=>a-b);
+  $("#wizn").textContent = ids.length===1 ? `photo #${ids[0]}`
+    : `${ids.length} photos: ${fmtIds(ids)}`;
+  buildWizard();
+  $("#wiz").classList.remove("hidden");
+  showStep(0);
+}
+function fmtIds(ids){ // compress 1,2,3,7 -> 1-3,7
+  const out=[]; let s=ids[0], p=ids[0];
+  for(const id of ids.slice(1)){
+    if(id===p+1){ p=id; continue; }
+    out.push(s===p?`${s}`:`${s}-${p}`); s=p=id;
+  }
+  out.push(s===p?`${s}`:`${s}-${p}`);
+  return out.join(",");
+}
+function currentVal(prm){
+  // value the selected photo currently has (single-select), else the pipeline default
+  const src = state.detail;
+  const dfl = state.defaults||{};
+  if(prm.g==="retouch")  return src ? src.retouch[prm.k] : dfl[prm.k];
+  if(prm.g==="clothing") return src ? (src.retouch.clothing||{})[prm.k] : (dfl.clothing||{})[prm.k];
+  if(prm.g==="background")return src ? (src.retouch.background||{})[prm.k] : (dfl.background||{})[prm.k];
+  if(prm.g==="develop")  return src ? (src.develop||{})[prm.k] : 0;
+  return undefined;
+}
+function buildWizard(){
+  $("#wiztabs").innerHTML = STEPS.map((s,i)=>
+    `<span class="tab" data-i="${i}">${s.title}<span class="dot hidden"></span></span>`).join("");
+  $("#wiztabs").querySelectorAll(".tab").forEach(t=>t.onclick=()=>showStep(+t.dataset.i));
+
+  const body = $("#wizbody");
+  body.innerHTML = STEPS.map((s,i)=>{
+    if(s.review) return `<div class="step hidden" data-i="${i}" id="review"></div>`;
+    let html = `<div class="step hidden" data-i="${i}">`;
+    if(s.hint) html += `<div class="hint">${s.hint}</div>`;
+    for(const prm of s.params){
+      if(prm.sect){ html += `<div class="sect">${prm.sect}</div>`; continue; }
+      if(prm.special==="wb"){ html += wbRow(); continue; }
+      html += paramRow(prm);
+    }
+    return html+"</div>";
+  }).join("");
+
+  // wire rows
+  body.querySelectorAll(".prow[data-k]").forEach(row=>{
+    const en = row.querySelector(".pen");
+    const sync = ()=>{ row.classList.toggle("off",!en.checked); updateDots(); };
+    en.addEventListener("change",sync); sync();
+    const rng = row.querySelector("input[type=range]");
+    if(rng){
+      const out = row.querySelector("output");
+      const upd = ()=>out.textContent = (+rng.value).toFixed(rng.step>=1?0:2);
+      rng.addEventListener("input",()=>{ if(!en.checked){en.checked=true;sync();} upd(); });
+      upd();
+    }
+    row.querySelectorAll("select,input[type=text]").forEach(c=>
+      c.addEventListener("input",()=>{ if(!en.checked){en.checked=true;sync();} onBgAction(); }));
+    const bool = row.querySelector(".pbool");
+    if(bool) bool.addEventListener("change",()=>{ if(!en.checked){en.checked=true;sync();} });
+  });
+  onBgAction();
+  wireWb();
+}
+function paramRow(prm){
+  const cur = currentVal(prm);
+  const curTxt = state.detail
+    ? `now: ${cur===undefined?"—":fmtV(cur)}`
+    : (state.selected.size>1?`default: ${cur===undefined?"—":fmtV(cur)}`:"");
+  const id = `p_${prm.g}_${prm.k}`;
+  let ctl;
+  if(prm.type==="bool"){
+    ctl = `<label class="ctl"><input type="checkbox" class="pbool"
+             ${cur===true?"checked":""}> on</label>`;
+  } else if(prm.type==="select"){
+    ctl = `<span class="ctl"><select>${prm.options.map(o=>
+      `<option ${String(cur)===o?"selected":""}>${o}</option>`).join("")}</select></span>`;
+  } else if(prm.type==="text"){
+    ctl = `<span class="ctl"><input type="text" placeholder="${prm.ph||""}"
+             value="${cur&&cur!=="none"?esc(String(cur)):""}"></span>`;
+  } else {
+    const v = typeof cur==="number"?cur:(prm.min<0?0:prm.min);
+    ctl = `<span class="ctl"><input type="range" min="${prm.min}" max="${prm.max}"
+             step="${prm.step}" value="${v}"><output></output></span>`;
+  }
+  return `<div class="prow off" data-g="${prm.g}" data-k="${prm.k}" id="${id}"
+            ${prm.showIf?'data-showif="1"':""}>
+    <input type="checkbox" class="pen" title="apply this parameter">
+    <span class="plabel">${prm.label}</span>${ctl}<span class="cur">${curTxt}</span></div>`;
+}
+function wbRow(){
+  const wb = state.detail ? (state.detail.develop.white_balance||{}) : {};
+  const curTxt = state.detail
+    ? `now: ${wb.mode==="kelvin"?`${wb.temp||6500}K${wb.tint?` tint ${wb.tint}`:""}`:"camera"}` : "";
+  return `<div class="prow off" data-g="wb" data-k="wb" id="p_wb">
+    <input type="checkbox" class="pen" title="apply white balance">
+    <span class="plabel">White balance</span>
+    <span class="ctl">
+      <select id="wbmode">
+        <option value="camera">camera (as-shot)</option>
+        <option value="kelvin">kelvin…</option>
+      </select>
+      <input type="number" id="wbtemp" value="${wb.temp||5500}" min="2000" max="50000"
+             step="50" style="width:90px" class="hidden" title="Kelvin">
+      <input type="number" id="wbtint" value="${wb.tint||0}" min="-50" max="50"
+             style="width:70px" class="hidden" title="tint −50 green … +50 magenta">
+    </span><span class="cur">${curTxt}</span></div>`;
+}
+function wireWb(){
+  const row = $("#p_wb"); if(!row) return;
+  const mode = $("#wbmode");
+  const upd = ()=>{
+    $("#wbtemp").classList.toggle("hidden",mode.value!=="kelvin");
+    $("#wbtint").classList.toggle("hidden",mode.value!=="kelvin");
+  };
+  mode.addEventListener("change",()=>{ row.querySelector(".pen").checked=true;
+    row.classList.remove("off"); upd(); updateDots(); });
+  upd();
+}
+function onBgAction(){
+  const actionRow = $("#p_background_action"); if(!actionRow) return;
+  const action = actionRow.querySelector("select").value;
+  const enabled = actionRow.querySelector(".pen").checked;
+  for(const prm of STEPS[4].params){
+    if(!prm.showIf) continue;
+    const row = document.getElementById(`p_background_${prm.k}`);
+    if(row) row.style.display = enabled && prm.showIf(action) ? "" : "none";
+  }
+}
+function fmtV(v){
+  if(typeof v==="number") return +v.toFixed(3);
+  if(typeof v==="boolean") return v?"on":"off";
+  return v;
+}
+function collectOverrides(){
+  const ov = {retouch:{}, develop:{}, white_balance:{}};
+  document.querySelectorAll("#wizbody .prow[data-k]").forEach(row=>{
+    if(!row.querySelector(".pen").checked) return;
+    const g = row.dataset.g, k = row.dataset.k;
+    if(g==="wb"){
+      ov.white_balance.mode = $("#wbmode").value;
+      if(ov.white_balance.mode==="kelvin"){
+        ov.white_balance.temp = +$("#wbtemp").value||5500;
+        ov.white_balance.tint = +$("#wbtint").value||0;
+      }
+      return;
+    }
+    let v;
+    const rng = row.querySelector("input[type=range]");
+    const sel = row.querySelector("select");
+    const txt = row.querySelector("input[type=text]");
+    const bool = row.querySelector(".pbool");
+    if(rng) v = +rng.value;
+    else if(sel) v = sel.value;
+    else if(txt){ v = txt.value.trim(); if(!v) return; }
+    else if(bool) v = bool.checked;
+    if(g==="retouch") ov.retouch[k]=v;
+    else if(g==="develop") ov.develop[k]=v;
+    else if(g==="clothing") (ov.retouch.clothing??={})[k]=v;
+    else if(g==="background"){
+      const b = (ov.retouch.background??={});
+      // only send color/prompt when relevant for the chosen action
+      if(k==="color"||k==="replace_prompt"){
+        const act = $("#p_background_action")?.querySelector("select").value;
+        if(k==="color"&&act!=="studio") return;
+        if(k==="replace_prompt"&&act!=="replace") return;
+      }
+      b[k]=v;
+    }
+  });
+  if(!Object.keys(ov.retouch).length) delete ov.retouch;
+  if(!Object.keys(ov.develop).length) delete ov.develop;
+  if(!Object.keys(ov.white_balance).length) delete ov.white_balance;
+  return ov;
+}
+function cliPreview(ov, ids, fromRaw, reanalyze, subjOnly, skinExp){
+  const parts = [`python -m pipeline.redo ${fmtIds(ids)}`];
+  const r = ov.retouch||{};
+  for(const [k,v] of Object.entries(r)){
+    if(k==="clothing"||k==="background")continue;
+    if(k==="remove_blemishes"){ parts.push(v?"--blemishes":"--no-blemishes"); continue; }
+    if(k==="auto_levels"){ if(v)parts.push("--auto-levels"); continue; }
+    if(k==="is_portrait")continue;
+    const f = FLAGS.retouch[k]; if(f) parts.push(`${f} ${fmtV(v)}`);
+  }
+  for(const [k,v] of Object.entries(r.clothing||{}))
+    parts.push(`${FLAGS.clothing[k]} ${fmtV(v)}`);
+  const b = r.background||{};
+  if(b.action) parts.push(`--background ${b.action}`);
+  if(b.color) parts.push(`--studio-color ${b.color}`);
+  if(b.replace_prompt) parts.push(`--prompt "${b.replace_prompt}"`);
+  for(const [k,v] of Object.entries(ov.develop||{}))
+    parts.push(`${FLAGS.develop[k]} ${fmtV(v)}`);
+  const wb = ov.white_balance||{};
+  if(wb.mode==="camera") parts.push("--wb camera");
+  if(wb.mode==="kelvin"){ parts.push(`--wb ${wb.temp}`); if(wb.tint)parts.push(`--tint ${wb.tint}`); }
+  if(fromRaw) parts.push("--from-raw");
+  if(reanalyze) parts.push("--reanalyze");
+  if(reanalyze&&subjOnly) parts.push("--subject-only");
+  if(reanalyze&&skinExp) parts.push("--skin-exposure");
+  return parts.join(" ");
+}
+function updateDots(){
+  // mark tabs that carry active params
+  document.querySelectorAll("#wizbody .step").forEach(step=>{
+    const i = +step.dataset.i;
+    const any = !!step.querySelector(".pen:checked");
+    const dot = $("#wiztabs").querySelectorAll(".tab")[i]?.querySelector(".dot");
+    if(dot) dot.classList.toggle("hidden",!any);
+  });
+}
+function showStep(i){
+  state.wizStep = i;
+  $("#wiztabs").querySelectorAll(".tab").forEach((t,ti)=>t.classList.toggle("on",ti===i));
+  $("#wizbody").querySelectorAll(".step").forEach(s=>
+    s.classList.toggle("hidden",+s.dataset.i!==i));
+  const last = i===STEPS.length-1;
+  $("#wizback").style.visibility = i?"visible":"hidden";
+  $("#wiznext").classList.toggle("hidden",last);
+  $("#wizrun").classList.toggle("hidden",!last);
+  if(last) renderReview();
+  updateDots();
+}
+function renderReview(){
+  const ids = [...state.selected].sort((a,b)=>a-b);
+  const ov = collectOverrides();
+  const fromRaw = $("#optraw")?.checked||false, rean = $("#optrean")?.checked||false;
+  const subjOnly = $("#optsubj")?.checked||false, skinExp = $("#optskin")?.checked||false;
+  const entries = [];
+  for(const [k,v] of Object.entries(ov.retouch||{})){
+    if(k==="clothing")for(const [ck,cv] of Object.entries(v))entries.push([`clothing.${ck}`,cv]);
+    else if(k==="background")for(const [bk,bv] of Object.entries(v))entries.push([`background.${bk}`,bv]);
+    else entries.push([k,v]);
+  }
+  for(const [k,v] of Object.entries(ov.develop||{}))entries.push([`develop.${k}`,v]);
+  if(ov.white_balance)entries.push(["white_balance",
+    ov.white_balance.mode==="kelvin"?`${ov.white_balance.temp}K tint ${ov.white_balance.tint||0}`:"camera"]);
+  $("#review").innerHTML = `
+    <div class="hint">Only the parameters you enabled are overridden — everything else keeps
+      each photo's current values. White balance / shadows / highlights force a re-develop.</div>
+    <div class="sect">Photos (${ids.length})</div>
+    <div class="item">${fmtIds(ids)}</div>
+    <div class="sect">Overrides (${entries.length})</div>
+    ${entries.length?entries.map(([k,v])=>
+      `<div class="item">• <b>${k}</b> → ${esc(String(fmtV(v)))}</div>`).join("")
+     :`<div class="item" style="color:var(--warn)">None — this re-renders with current params.</div>`}
+    <div class="optrow">
+      <label><input type="checkbox" id="optraw" ${fromRaw?"checked":""}> re-develop from RAW</label>
+      <label><input type="checkbox" id="optrean" ${rean?"checked":""}> re-run AI analysis (uses API)</label>
+    </div>
+    <div class="optrow" style="margin-top:-6px;${rean?"":"opacity:.45"}">
+      <span style="font-size:12px">analysis metering:</span>
+      <label><input type="checkbox" id="optsubj" ${subjOnly?"checked":""} ${rean?"":"disabled"}>
+        subject only (mask background)</label>
+      <label><input type="checkbox" id="optskin" ${skinExp?"checked":""} ${rean?"":"disabled"}>
+        skin exposure (meter on skin)</label>
+    </div>
+    <div class="sect">Equivalent command</div>
+    <code>${esc(cliPreview(ov,ids,fromRaw,rean,subjOnly,skinExp))}</code>`;
+  $("#optraw").onchange = renderReview;
+  $("#optrean").onchange = renderReview;
+  $("#optsubj").onchange = renderReview;
+  $("#optskin").onchange = renderReview;
+}
+$("#wizback").onclick = ()=>showStep(Math.max(0,state.wizStep-1));
+$("#wiznext").onclick = ()=>showStep(Math.min(STEPS.length-1,state.wizStep+1));
+$("#wizclose").onclick = ()=>$("#wiz").classList.add("hidden");
+$("#wizrun").onclick = async ()=>{
+  const ids = [...state.selected].sort((a,b)=>a-b);
+  const rean = $("#optrean")?.checked||false;
+  const payload = {ids, overrides: collectOverrides(),
+    from_raw: $("#optraw")?.checked||false, reanalyze: rean,
+    subject_only: rean && ($("#optsubj")?.checked||false),
+    skin_exposure: rean && ($("#optskin")?.checked||false)};
+  $("#wizrun").disabled = true;
+  try{
+    const r = await fetch("/api/redo",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.error||r.status);
+    $("#wiz").classList.add("hidden");
+    openJobs(); pollJobs(true);
+  }catch(e){ $("#wizmsg").textContent = "Error: "+e.message; }
+  finally{ $("#wizrun").disabled = false; }
+};
+
+/* ================= jobs ================= */
+let jobsTimer = null, lastDoneSig = "";
+function openJobs(){ $("#jobs").classList.remove("hidden"); pollJobs(true); }
+$("#jobsbtn").onclick = ()=>$("#jobs").classList.contains("hidden")
+  ? openJobs() : $("#jobs").classList.add("hidden");
+$("#jobsclose").onclick = ()=>$("#jobs").classList.add("hidden");
+async function pollJobs(force){
+  const j = await (await fetch("/api/jobs")).json();
+  state.jobs = j.jobs;
+  renderJobs();
+  // refresh gallery when new renders complete
+  const sig = state.jobs.map(job=>Object.values(job.items)
+    .filter(i=>i.status==="done").length).join(",");
+  if(sig!==lastDoneSig){ lastDoneSig = sig; loadPhotos(); if(state.lbId)refreshLightbox(); }
+  const active = state.jobs.some(job=>job.state==="queued"||job.state==="running");
+  $("#jobsbtn").innerHTML = "Jobs"+(active?'<span class="live"></span>':"");
+  clearTimeout(jobsTimer);
+  if(active || !$("#jobs").classList.contains("hidden"))
+    jobsTimer = setTimeout(()=>pollJobs(), 2500);
+}
+function renderJobs(){
+  const el = $("#jobslist");
+  if(!state.jobs.length){ el.innerHTML = `<div class="job" style="color:var(--dim)">No jobs yet.</div>`; return; }
+  el.innerHTML = state.jobs.map(job=>{
+    const items = Object.entries(job.items);
+    const done = items.filter(([,i])=>i.status==="done").length;
+    const err = items.filter(([,i])=>i.status==="error").length;
+    const pct = Math.round(100*(done+err+items.filter(([,i])=>i.status==="cancelled").length)/items.length);
+    const cancellable = job.state==="queued"||job.state==="running";
+    return `<div class="job">
+      <div class="row1"><b>${job.id}</b>
+        <span class="badge ${job.state==="done"?"done":job.state==="running"?"analyzed":""}">${job.state}</span>
+        <span style="color:var(--dim)">${done}/${items.length} done${err?`, ${err} failed`:""}</span>
+        <span class="spacer"></span>
+        ${cancellable?`<button class="ghost" data-cancel="${job.id}">cancel</button>`:""}</div>
+      <div class="bar"><i style="width:${pct}%"></i></div>
+      <div class="items">${items.map(([pid,i])=>
+        `<span class="pill ${i.status}" title="${esc(i.error||i.output||"")}">#${pid} ${i.status}</span>`).join("")}
+      </div></div>`;
+  }).join("");
+  el.querySelectorAll("[data-cancel]").forEach(b=>b.onclick=async ()=>{
+    await fetch(`/api/jobs/${b.dataset.cancel}/cancel`,{method:"POST"}); pollJobs(true);
+  });
+}
+
+/* ================= misc ================= */
+function esc(s){ return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",
+  '"':"&quot;","'":"&#39;"}[c])); }
+document.addEventListener("keydown",e=>{
+  if(e.key==="Escape"){ $("#lb").classList.add("hidden"); $("#wiz").classList.add("hidden"); }
+  if(!$("#lb").classList.contains("hidden")){
+    if(e.key==="ArrowLeft")lbStep(-1);
+    if(e.key==="ArrowRight")lbStep(1);
+  }
+});
+loadPhotos(); pollJobs();
+</script>
+</body>
+</html>

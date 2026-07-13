@@ -2,8 +2,14 @@
 
 Starts the inbox watcher (background thread) and the worker loop (main thread).
 Ctrl-C to stop.
+
+Retouch/white-balance flags (same as `pipeline.redo`) can be passed to force
+settings onto every photo the worker processes, e.g.:
+
+    python -m pipeline.run --skin 0.3 --dewlap 0.3 --wb camera --background blur
 """
 
+import argparse
 import logging
 import os
 import sys
@@ -11,6 +17,7 @@ from pathlib import Path
 
 from .config import CONFIG
 from . import db, watcher, worker
+from .overrides import add_override_args, describe, overrides_from_args
 from .preview import find_tool
 
 
@@ -47,6 +54,27 @@ def check_tools() -> None:
 
 
 def main() -> None:
+    p = argparse.ArgumentParser(
+        prog="python -m pipeline.run",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--once", action="store_true",
+                   help="process all currently-pending photos, then exit (no watching)")
+    p.add_argument("--requeue-stuck", action="store_true",
+                   help="reset photos stuck in 'previewed' (interrupted runs) back to pending first")
+    p.add_argument("--requeue-review", action="store_true",
+                   help="also requeue photos parked in 'review' (low confidence)")
+    p.add_argument("--reanalyze", action="store_true",
+                   help="with --requeue-*, wipe cached analysis so the AI re-analyzes from scratch")
+    add_override_args(p)
+    args = p.parse_args()
+    overrides = overrides_from_args(args)
+    if args.subject_only:
+        CONFIG.analyze_subject_only = True
+    if args.skin_exposure:
+        CONFIG.analyze_skin_exposure = True
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)-8s %(levelname)-7s %(message)s",
@@ -56,14 +84,34 @@ def main() -> None:
     check_tools()
     check_credentials()
 
+    if overrides:
+        logging.info("Forcing overrides on every photo: %s", describe(overrides))
+
     conn = db.connect(CONFIG.db_path)
+
+    if args.requeue_stuck or args.requeue_review:
+        states = ("previewed",) + (("review",) if args.requeue_review else ())
+        n = db.requeue(conn, states, clear_analysis=args.reanalyze)
+        logging.info("Requeued %d stuck photo(s) from %s%s", n, "/".join(states),
+                     " (fresh AI analysis)" if args.reanalyze else "")
+
     added = watcher.scan_existing(conn)
     if added:
         logging.info("Startup scan enqueued %d file(s)", added)
 
+    # One-shot: drain the queue and exit (no watcher, no idle loop).
+    if args.once:
+        try:
+            worker.drain(conn, overrides)
+        except KeyboardInterrupt:
+            logging.info("Interrupted")
+        finally:
+            conn.close()
+        return
+
     observer = watcher.start_observer(conn)
     try:
-        worker.run_forever(conn)
+        worker.run_forever(conn, overrides)
     except KeyboardInterrupt:
         logging.info("Shutting down")
     finally:

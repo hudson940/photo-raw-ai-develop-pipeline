@@ -78,6 +78,19 @@ def _wb_relative_multipliers(kelvin: float) -> tuple[float, float, float]:
     return (r / g, 1.0, b / g)
 
 
+def _highlight_rolloff(img: np.ndarray, knee: float) -> np.ndarray:
+    """Soft-clip highlights: values above `knee` roll off toward 1.0 (asymptotically) instead
+    of hard-clipping, so bright skin/specular keeps gradation rather than blowing to white.
+    knee=1.0 disables it (plain clip)."""
+    img = np.clip(img, 0.0, None)
+    if knee >= 1.0:
+        return np.clip(img, 0, 1)
+    hi = img > knee
+    span = 1.0 - knee
+    img[hi] = knee + span * (1.0 - np.exp(-(img[hi] - knee) / span))
+    return np.clip(img, 0, 1)
+
+
 def _apply_tint(r: float, g: float, b: float, tint: float) -> tuple[float, float, float]:
     """Shift green-magenta balance. tint in [-50, 50], 0 = neutral."""
     factor = 10 ** (tint / 200.0)
@@ -239,13 +252,20 @@ def develop(raw_path: Path, analysis_json: str, output_dir: Path) -> Path:
     ev = dp.get("exposure_ev", 0.0)
     img *= 2.0 ** ev
 
-    img = np.clip(img, 0, 1)
+    # Highlight rolloff instead of a hard clip: bright skin/specular that would blow out to
+    # flat white (common when auto-brighten over-lifts a low-key scene and the AI adds a bit
+    # of exposure on top) is compressed smoothly toward 1.0, keeping tone/detail in highlights.
+    img = _highlight_rolloff(img, CONFIG.highlight_rolloff_knee)
 
     # Contrast / highlights / shadows
     img = _tone_curve(img, dp.get("contrast", 0.0), dp.get("highlights", 0.0), dp.get("shadows", 0.0))
 
     # Saturation / vibrance
     img = _apply_saturation_vibrance(img, dp.get("saturation", 0.0), dp.get("vibrance", 0.0))
+
+    # Final highlight rolloff — the contrast S-curve above pushes highlights back up, so we
+    # protect them again as the last step before clipping.
+    img = _highlight_rolloff(img, CONFIG.highlight_rolloff_knee)
 
     # Convert back to 16-bit
     img_16 = (np.clip(img, 0, 1) * 65535).astype(np.uint16)

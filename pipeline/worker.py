@@ -5,6 +5,7 @@ don't parallelize on a single card, so the queue discipline starts here.
 Low-confidence analyses are routed to the 'review' state instead of continuing.
 """
 
+import json
 import logging
 import sqlite3
 import time
@@ -17,6 +18,7 @@ from . import db
 from .analysis import analyze_preview, verify_vision
 from .develop import develop, DevelopError
 from .output import finalize
+from .overrides import apply_overrides, background_overridden, force_keep_background
 from .preview import make_preview
 from .retouch import retouch
 
@@ -77,8 +79,13 @@ def _stage_finalize(
         db.set_state(conn, photo_id, "done", error=f"finalize_partial: {exc}")
 
 
-def process_one(conn: sqlite3.Connection, client: anthropic.Anthropic) -> bool:
-    """Process the next pending photo through all stages. Returns False if queue empty."""
+def process_one(conn: sqlite3.Connection, client: anthropic.Anthropic,
+                overrides: dict | None = None) -> bool:
+    """Process the next pending photo through all stages. Returns False if queue empty.
+
+    `overrides` are global retouch/white-balance settings (from `pipeline.run` flags)
+    forced onto every photo's analysis before develop/retouch.
+    """
     row = db.claim_next_pending(conn)
     if row is None:
         return False
@@ -132,6 +139,13 @@ def process_one(conn: sqlite3.Connection, client: anthropic.Anthropic) -> bool:
             log.info("#%d re-using cached analysis (retrying develop/retouch)", photo_id)
             preview_path = Path(row["preview_path"]) if row["preview_path"] else None
 
+        # Apply global CLI overrides (from `pipeline.run --skin ... --wb ...`) on top of
+        # the AI analysis, and keep the background as-is unless --background was passed.
+        adict = apply_overrides(json.loads(analysis_json), overrides)
+        if not background_overridden(overrides):
+            force_keep_background(adict)
+        analysis_json = json.dumps(adict)
+
         # Stage 4 — develop (RAW -> TIFF)
         tiff_path = _stage_develop(conn, photo_id, raw_path, analysis_json)
         if tiff_path is None:
@@ -161,10 +175,22 @@ def process_one(conn: sqlite3.Connection, client: anthropic.Anthropic) -> bool:
     return True
 
 
-def run_forever(conn: sqlite3.Connection) -> None:
+def drain(conn: sqlite3.Connection, overrides: dict | None = None) -> int:
+    """Process every currently-ready pending photo, then return (no watching/looping)."""
+    client = anthropic.Anthropic()
+    verify_vision(client)
+    log.info("Draining pending queue (model=%s)", CONFIG.model)
+    processed = 0
+    while process_one(conn, client, overrides):
+        processed += 1
+    log.info("Drain complete — %d photo(s) processed", processed)
+    return processed
+
+
+def run_forever(conn: sqlite3.Connection, overrides: dict | None = None) -> None:
     client = anthropic.Anthropic()
     verify_vision(client)
     log.info("Worker started (model=%s, confidence threshold=%.2f)", CONFIG.model, CONFIG.confidence_threshold)
     while True:
-        if not process_one(conn, client):
+        if not process_one(conn, client, overrides):
             time.sleep(CONFIG.scan_interval_s)
