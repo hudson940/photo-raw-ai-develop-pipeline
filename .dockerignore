@@ -9,3 +9,5 @@ __pycache__/
 *.pyc
 .env
 data.db
+web/node_modules/
+web/dist/

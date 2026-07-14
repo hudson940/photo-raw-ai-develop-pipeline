@@ -2,7 +2,7 @@
 
 Consumes rows in the developed/retouched state and:
 - Copies the final image to output/ with an organised name
-- Moves the RAW to archive/ and writes a RapidRaw `.rrdata` sidecar of the develop params next to it
+- Moves the RAW to archive/ (and, only if PIPELINE_WRITE_RRDATA=1, a RapidRaw `.rrdata` sidecar)
 - Writes a decision log (JSON) recording every pipeline decision
 - Handles photos in the review state via a simple CLI gate
 """
@@ -108,7 +108,11 @@ def write_rapidraw_sidecar(filename: str, analysis_json: str | None) -> Path | N
 
     Only the develop (tonal) parameters transfer — RapidRaw is a RAW developer, so the
     face/skin/hair/background retouch has no equivalent there.
+
+    Disabled by default (CONFIG.write_rrdata); enable with PIPELINE_WRITE_RRDATA=1.
     """
+    if not CONFIG.write_rrdata:
+        return None
     if not analysis_json:
         return None
     dp = json.loads(analysis_json).get("develop", {})

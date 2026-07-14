@@ -58,6 +58,9 @@ class Config:
     # model meters exposure on the skin — avoids over-exposing skin in low-key / bright-skin scenes.
     analyze_skin_exposure: bool = os.environ.get("PIPELINE_ANALYZE_SKIN_EXPOSURE", "").lower() in ("1", "true", "yes")
 
+    # Web UI uploads (RAW files dropped into the inbox through the browser)
+    max_upload_mb: int = int(os.environ.get("PIPELINE_MAX_UPLOAD_MB", "200"))
+
     # Watcher / worker behavior
     scan_interval_s: float = float(os.environ.get("PIPELINE_SCAN_INTERVAL", "5"))
     stable_check_delay_s: float = float(os.environ.get("PIPELINE_STABLE_DELAY", "2"))
@@ -74,6 +77,9 @@ class Config:
     # Stage 7 — final delivery
     output_jpeg_quality: int = int(os.environ.get("PIPELINE_JPEG_QUALITY", "90"))
     keep_intermediate_tiffs: bool = os.environ.get("PIPELINE_KEEP_TIFFS", "").lower() in ("1", "true", "yes")
+    # RapidRaw `.rrdata` sidecar next to the archived RAW. Off by default (only useful if you
+    # open the RAWs in RapidRaw); enable with PIPELINE_WRITE_RRDATA=1.
+    write_rrdata: bool = os.environ.get("PIPELINE_WRITE_RRDATA", "").lower() in ("1", "true", "yes")
 
     # Stage 5-6 — retouch. birefnet-general is much more accurate for people/clothing than
     # u2net (which grays out dark gowns etc.); it's slower (~15s/photo on CPU) but only runs

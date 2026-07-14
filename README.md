@@ -395,9 +395,24 @@ python -m pipeline.webui                 # http://127.0.0.1:8765 (localhost only
 python -m pipeline.webui --host 0.0.0.0  # reachable from the LAN
 ```
 
-A single-page gallery over the queue DB — no new dependencies (stdlib HTTP server + one HTML
-file). It shows every photo with its latest render (state, confidence, portrait flag), with
-filtering by state and filename search.
+A **React single-page app** (Vite, in `web/`) over the queue DB, served as static assets by the
+stdlib HTTP backend — mobile-responsive, with a collapsing header menu on small screens. It shows
+every photo with its latest render (state, confidence, portrait flag), with filtering by state and
+filename search.
+
+Build (the Docker image does this automatically in a Node stage):
+
+```bash
+cd web && npm install && npm run build      # -> web/dist, served at /
+cd web && npm run dev                        # hot-reload dev server, proxies the API to :8765
+```
+
+The backend serves `web/dist` when present and falls back to the legacy single-file UI otherwise,
+so a bare `python -m pipeline.webui` still works from a source checkout without Node.
+
+- **Upload** — drag-and-drop (or pick) RAW files right in the browser; they land in the inbox and
+  enter the pipeline immediately. An editor's uploads become *their own* photos (multi-tenancy);
+  super admins / open mode upload shared photos. RAW only (`CR3`, `NEF`, `ARW`, `DNG`, …).
 
 - **Lightbox** — click a photo: full-size render, compare with the **original preview**, inspect
   the exact develop/retouch parameters and the copy-paste `redo` command that reproduces them.

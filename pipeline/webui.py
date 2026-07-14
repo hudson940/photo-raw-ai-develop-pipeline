@@ -40,13 +40,23 @@ from urllib.parse import parse_qs, urlparse
 from PIL import Image, ImageOps
 
 from . import auth, db
-from .config import CONFIG
+from .config import CONFIG, RAW_EXTENSIONS
 from .redo import _DEFAULT_RETOUCH, _process_photo, _reproduce_command
 from .storage import STORAGE
 
 log = logging.getLogger("webui")
 
-_HTML_PATH = Path(__file__).with_name("webui.html")
+# Built React SPA (Vite -> web/dist). Falls back to the legacy single-file UI when the
+# SPA hasn't been built (e.g. a source checkout without `npm run build`).
+_DIST_DIR = Path(__file__).resolve().parent.parent / "web" / "dist"
+_SPA_INDEX = _DIST_DIR / "index.html"
+_LEGACY_HTML = Path(__file__).with_name("webui.html")
+_HTML_PATH = _SPA_INDEX if _SPA_INDEX.exists() else _LEGACY_HTML
+
+_ASSET_TYPES = {".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml",
+                ".png": "image/png", ".jpg": "image/jpeg", ".ico": "image/x-icon",
+                ".woff2": "font/woff2", ".woff": "font/woff", ".json": "application/json",
+                ".map": "application/json", ".webp": "image/webp"}
 _THUMB_LONG_EDGE = 512
 _THUMB_LOCK = threading.Lock()
 
@@ -331,6 +341,10 @@ def _photo_row(conn, photo_id: int):
     return conn.execute("SELECT * FROM photos WHERE id = ?", (photo_id,)).fetchone()
 
 
+def _photo_row_by_name(conn, filename: str):
+    return conn.execute("SELECT * FROM photos WHERE filename = ?", (filename,)).fetchone()
+
+
 def _image_source(row, prefer_preview: bool = False) -> Path | None:
     """Best available JPEG for a photo: the published render, else the analysis preview.
     Falls back to object storage (downloading into the local cache) when configured."""
@@ -571,6 +585,34 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     # --- routes ---------------------------------------------------------
+    def _serve_index(self, share_cfg: dict | None = None) -> None:
+        """Serve the SPA's index.html with a runtime config injected as window.__CONFIG__.
+        Works for the built React app and the legacy single-file UI alike."""
+        html = _HTML_PATH.read_text()
+        cfg = {"share": share_cfg} if share_cfg else {}
+        inject = f"<script>window.__CONFIG__={json.dumps(cfg)};</script>"
+        # legacy file reads window.SHARE; keep it working too
+        if share_cfg:
+            inject += f"<script>window.SHARE={json.dumps(share_cfg)};</script>"
+        html = html.replace("<head>", "<head>" + inject, 1) if "<head>" in html \
+            else inject + html
+        body = html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_asset(self, rel: str) -> None:
+        """Serve a built static asset from web/dist (Vite output). 404 if missing."""
+        target = (_DIST_DIR / rel).resolve()
+        if not str(target).startswith(str(_DIST_DIR.resolve())) or not target.is_file():
+            return self._error(404, "not found")
+        ctype = _ASSET_TYPES.get(target.suffix.lower(), "application/octet-stream")
+        # hashed asset filenames are immutable; index/other served no-store implicitly
+        self._file(target, ctype, cache=target.parent.name == "assets")
+
     def _serve_thumb(self, photo_id: int, url) -> None:
         row = _photo_row(self._conn(), photo_id)
         thumb = _thumb_path(row) if row else None
@@ -594,7 +636,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._share_get(m.group(1), m.group(2) or "/", url)
             # --- public (no session needed) ---
             if url.path in ("/", "/index.html"):
-                return self._file(_HTML_PATH, "text/html; charset=utf-8")
+                return self._serve_index()
+            if m := re.fullmatch(r"/(assets/.+|favicon\.[a-z]+|[\w.-]+\.(?:svg|png|ico|webp|woff2?|js|css))",
+                                 url.path):
+                return self._serve_asset(m.group(1))
             if url.path == "/api/me":
                 user = self._current_user()
                 return self._json({"authenticated": user is not None, "auth": auth.enabled(),
@@ -651,19 +696,11 @@ class Handler(BaseHTTPRequestHandler):
         if sub in ("", "/"):
             album = conn.execute("SELECT name FROM albums WHERE id=?",
                                  (share["album_id"],)).fetchone()
-            cfg = {"prefix": f"/share/{token}", "permission": share["permission"],
-                   "album": album["name"] if album else "Album"}
-            html = _HTML_PATH.read_text()
-            html = html.replace(
-                "<script>", f"<script>window.SHARE = {json.dumps(cfg)};</script>\n<script>", 1)
-            body = html.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
-            return
+            return self._serve_index(share_cfg={
+                "prefix": f"/share/{token}", "permission": share["permission"],
+                "album": album["name"] if album else "Album"})
+        if m := re.fullmatch(r"/(assets/.+|[\w.-]+\.(?:svg|png|ico|webp|woff2?|js|css))", sub):
+            return self._serve_asset(m.group(1))   # share pages load the same bundle
         if sub == "/api/photos":
             photos = [p for p in _list_photos(conn) if p["id"] in decisions]
             for p in photos:
@@ -716,6 +753,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if url.path == "/api/redo":
                 return self._redo(user=user)
+            if url.path == "/api/upload":
+                return self._upload(user)
             if m := re.fullmatch(r"/api/photos/(\d+)/erase", url.path):
                 return self._erase(int(m.group(1)), user=user)
             if m := re.fullmatch(r"/api/photos/(\d+)/select", url.path):
@@ -820,6 +859,54 @@ class Handler(BaseHTTPRequestHandler):
         except auth.AuthError as exc:
             return self._error(400, str(exc))
         self._json({"ok": True})
+
+    def _upload(self, user: dict) -> None:
+        """Accept a RAW file upload and drop it in the uploader's inbox subfolder so the
+        watcher ingests it with the right owner. The raw file bytes are the request body;
+        the filename comes from ?filename=… (avoids multipart parsing in the stdlib server).
+        Editors upload into inbox/<username>/; super admin / open mode into the inbox root."""
+        from . import watcher
+        params = parse_qs(urlparse(self.path).query)
+        raw_name = (params.get("filename", [""])[0] or "").strip()
+        name = Path(raw_name).name                      # strip any path components
+        if not name:
+            return self._error(400, "filename query parameter required")
+        if Path(name).suffix.lower() not in RAW_EXTENSIONS:
+            return self._error(415, "only RAW files are accepted (e.g. .CR3, .NEF, .ARW, .DNG)")
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length <= 0:
+            return self._error(400, "empty upload")
+        if length > CONFIG.max_upload_mb * 1024 * 1024:
+            return self._error(413, f"file exceeds the {CONFIG.max_upload_mb} MB limit")
+
+        owner = None if auth.is_super_admin(user) else user["username"]
+        dest_dir = CONFIG.inbox / owner if owner else CONFIG.inbox
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / name
+        if dest.exists() or _photo_row_by_name(self._conn(), name) is not None:
+            return self._error(409, f"a photo named {name} already exists")
+
+        # stream the body to a temp file, then atomically move into the inbox
+        tmp = dest.with_name(dest.name + ".part")
+        remaining, chunk = length, 1024 * 256
+        try:
+            with open(tmp, "wb") as f:
+                while remaining > 0:
+                    buf = self.rfile.read(min(chunk, remaining))
+                    if not buf:
+                        break
+                    f.write(buf)
+                    remaining -= len(buf)
+            tmp.replace(dest)
+        except Exception as exc:
+            tmp.unlink(missing_ok=True)
+            return self._error(500, f"upload failed: {exc}")
+        if db.enqueue(self._conn(), dest, owner):
+            log.info("Uploaded %s (owner=%s) -> queued", name, owner or "-")
+        self._json({"ok": True, "filename": name, "owner": owner}, 201)
 
     # --- operator photo actions -----------------------------------------
     def _set_selected(self, photo_id: int, user: dict) -> None:
