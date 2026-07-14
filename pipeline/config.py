@@ -127,6 +127,15 @@ class Config:
     s3_region: str = os.environ.get("S3_REGION", "")
     s3_prefix: str = os.environ.get("S3_PREFIX", "").strip("/")
 
+    # Pre-processing quality gate (pipeline.quality). When on, blurry / badly-exposed
+    # photos are detected on the preview BEFORE analysis+develop, parked in 'rejected',
+    # and defaulted to not-selected (the operator can still force-process them).
+    quality_gate: bool = os.environ.get("PIPELINE_QUALITY_GATE", "1").lower() in ("1", "true", "yes")
+    quality_blur_min: float = float(os.environ.get("PIPELINE_QUALITY_BLUR_MIN", "60"))
+    quality_dark_max: float = float(os.environ.get("PIPELINE_QUALITY_DARK_MAX", "55"))
+    quality_bright_min: float = float(os.environ.get("PIPELINE_QUALITY_BRIGHT_MIN", "205"))
+    quality_clip_frac: float = float(os.environ.get("PIPELINE_QUALITY_CLIP_FRAC", "0.30"))
+
     # ComfyUI (used only for generative background replacement)
     comfyui_url: str = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
     comfyui_timeout: int = int(os.environ.get("COMFYUI_TIMEOUT", "600"))

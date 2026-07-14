@@ -20,6 +20,7 @@ from .develop import develop, DevelopError
 from .output import finalize
 from .overrides import apply_overrides, background_overridden, force_keep_background
 from .preview import make_preview
+from .quality import assess
 from .retouch import retouch
 
 log = logging.getLogger("worker")
@@ -111,6 +112,26 @@ def process_one(conn: sqlite3.Connection, client: anthropic.Anthropic,
             if preview_path is None or not preview_path.exists():
                 preview_path = make_preview(raw_path)
                 db.set_state(conn, photo_id, "previewed", preview_path=str(preview_path))
+
+            # Stage 2.5 — quality gate: skip blurry / badly-exposed shots before spending
+            # AI analysis + develop on them. Force-process a rejected keeper later with
+            # `redo <id> --reanalyze` (which bypasses this gate entirely).
+            if CONFIG.quality_gate:
+                report = assess(preview_path)
+                if not report["passed"]:
+                    db.set_state(
+                        conn, photo_id, "rejected",
+                        preview_path=str(preview_path),
+                        quality_json=json.dumps(report),
+                        selected=0,                       # default to not-selected
+                        error=f"quality: {report['reason']}",
+                    )
+                    log.info("#%d rejected by quality gate — %s", photo_id, report["reason"])
+                    return True
+                # passed: still record the metrics for the UI
+                db.set_state(conn, photo_id, "previewed",
+                             preview_path=str(preview_path),
+                             quality_json=json.dumps(report))
 
             # Stage 3 — AI analysis
             result = analyze_preview(preview_path, client)

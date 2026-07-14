@@ -22,10 +22,29 @@ CREATE TABLE IF NOT EXISTS photos (
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at REAL NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    owner TEXT,                 -- username of the editor who owns this photo (NULL = shared/admin)
+    quality_json TEXT,          -- pre-processing blur/exposure assessment (see pipeline.quality)
+    selected INTEGER            -- operator pick: NULL undecided / 1 selected / 0 not-selected
 );
 CREATE INDEX IF NOT EXISTS idx_photos_state ON photos(state);
+CREATE INDEX IF NOT EXISTS idx_photos_owner ON photos(owner);
 """
+
+# Columns added after the first release; ALTER-ed in on connect for existing DBs.
+_MIGRATIONS = {
+    "owner": "ALTER TABLE photos ADD COLUMN owner TEXT",
+    "quality_json": "ALTER TABLE photos ADD COLUMN quality_json TEXT",
+    "selected": "ALTER TABLE photos ADD COLUMN selected INTEGER",
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(photos)")}
+    with conn:
+        for col, ddl in _MIGRATIONS.items():
+            if col not in have:
+                conn.execute(ddl)
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -33,18 +52,23 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
-def enqueue(conn: sqlite3.Connection, path: Path) -> bool:
-    """Insert a new photo in 'pending' state. Returns False if already known."""
+def enqueue(conn: sqlite3.Connection, path: Path, owner: str | None = None) -> bool:
+    """Insert a new photo in 'pending' state. Returns False if already known.
+
+    `owner` is the editor username the photo belongs to (from its inbox subfolder);
+    NULL means a shared/admin photo visible to every operator.
+    """
     now = time.time()
     try:
         with conn:
             conn.execute(
-                "INSERT INTO photos (path, filename, state, created_at, updated_at)"
-                " VALUES (?, ?, 'pending', ?, ?)",
-                (str(path), path.name, now, now),
+                "INSERT INTO photos (path, filename, state, owner, created_at, updated_at)"
+                " VALUES (?, ?, 'pending', ?, ?, ?)",
+                (str(path), path.name, owner, now, now),
             )
         return True
     except sqlite3.IntegrityError:
