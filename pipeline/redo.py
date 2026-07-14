@@ -171,10 +171,11 @@ def _reproduce_command(photo_id: int, analysis: dict) -> str:
 
 
 def _find_raw(row) -> Path | None:
-    for candidate in (Path(row["path"]), CONFIG.archive / row["filename"]):
-        if candidate.exists():
-            return candidate
-    return None
+    if Path(row["path"]).exists():
+        return Path(row["path"])
+    # archived RAW — possibly only in object storage (fresh container / cold cache)
+    from .storage import STORAGE
+    return STORAGE.get(CONFIG.archive / row["filename"])
 
 
 def _reanalyze(row) -> dict:

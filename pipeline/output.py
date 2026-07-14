@@ -18,6 +18,7 @@ import tifffile
 from PIL import Image, ImageOps
 
 from .config import CONFIG
+from .storage import STORAGE
 
 log = logging.getLogger("output")
 
@@ -76,15 +77,17 @@ def publish_done(photo_id: int, filename: str, image_path: Path) -> Path:
     size_mb = out_path.stat().st_size / 1e6
     log.info("Published %s -> %s (%.1f MB, q%d)", image_path.name, out_name, size_mb,
              CONFIG.output_jpeg_quality)
+    STORAGE.put(out_path)
     return out_path
 
 
 def archive_raw(raw_path: Path) -> Path:
-    """Move a processed RAW to the archive directory."""
+    """Move a processed RAW to the archive directory (and mirror it to object storage)."""
     dest = CONFIG.archive / raw_path.name
     if raw_path.exists():
         shutil.move(str(raw_path), str(dest))
         log.info("Archived %s", raw_path.name)
+        STORAGE.put(dest)
     return dest
 
 
@@ -138,6 +141,7 @@ def write_rapidraw_sidecar(filename: str, analysis_json: str | None) -> Path | N
     CONFIG.archive.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
     log.info("Wrote RapidRaw sidecar %s", dest.name)
+    STORAGE.put(dest)
     return dest
 
 
@@ -146,6 +150,7 @@ def write_decision_log(log_entry: dict) -> Path:
     log_path = CONFIG.root / "decision_log.jsonl"
     with open(log_path, "a") as f:
         f.write(json.dumps(log_entry) + "\n")
+    STORAGE.put(log_path)
     return log_path
 
 

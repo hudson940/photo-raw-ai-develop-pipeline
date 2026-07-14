@@ -42,6 +42,7 @@ from PIL import Image, ImageOps
 from . import db
 from .config import CONFIG
 from .redo import _DEFAULT_RETOUCH, _process_photo, _reproduce_command
+from .storage import STORAGE
 
 log = logging.getLogger("webui")
 
@@ -321,12 +322,13 @@ def _photo_row(conn, photo_id: int):
 
 
 def _image_source(row, prefer_preview: bool = False) -> Path | None:
-    """Best available JPEG for a photo: the published render, else the analysis preview."""
+    """Best available JPEG for a photo: the published render, else the analysis preview.
+    Falls back to object storage (downloading into the local cache) when configured."""
     out = _output_path(row["id"], row["filename"])
     preview = Path(row["preview_path"]) if row["preview_path"] else None
     candidates = [preview, out] if prefer_preview else [out, preview]
     for p in candidates:
-        if p is not None and p.exists():
+        if p is not None and STORAGE.get(p) is not None:
             return p
     return None
 
@@ -349,6 +351,7 @@ def _thumb_path(row) -> Path | None:
         tmp = thumb.with_suffix(".tmp.jpg")
         img.convert("RGB").save(tmp, "JPEG", quality=82)
         tmp.replace(thumb)
+    STORAGE.put(thumb)
     return thumb
 
 
@@ -362,7 +365,7 @@ def _list_photos(conn) -> list[dict]:
         analysis = json.loads(r["analysis_json"]) if r["analysis_json"] else {}
         rp = analysis.get("retouch") or {}
         out = _output_path(r["id"], r["filename"])
-        has_output = out.exists()
+        has_output = STORAGE.exists(out)
         photos.append({
             "id": r["id"],
             "filename": r["filename"],
@@ -372,8 +375,8 @@ def _list_photos(conn) -> list[dict]:
             "scene": (analysis.get("scene_description") or "")[:160],
             "has_analysis": bool(r["analysis_json"]),
             "has_output": has_output,
-            "output_mtime": int(out.stat().st_mtime) if has_output else 0,
-            "has_preview": bool(r["preview_path"] and Path(r["preview_path"]).exists()),
+            "output_mtime": int(STORAGE.mtime(out)) if has_output else 0,
+            "has_preview": bool(r["preview_path"] and STORAGE.exists(Path(r["preview_path"]))),
         })
     return photos
 
@@ -708,7 +711,7 @@ class Handler(BaseHTTPRequestHandler):
         masks_dir = CONFIG.root / "masks"
         mask_name = f"{photo_id}.png"
         if body.get("clear"):
-            (masks_dir / mask_name).unlink(missing_ok=True)
+            STORAGE.delete(masks_dir / mask_name)
             erase = {"mask": ""}
         else:
             data_url = body.get("mask") or ""
@@ -717,6 +720,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, "mask must be a data:image/png;base64 URL")
             masks_dir.mkdir(parents=True, exist_ok=True)
             (masks_dir / mask_name).write_bytes(base64.b64decode(m.group(1)))
+            STORAGE.put(masks_dir / mask_name)
             erase = {"mask": mask_name,
                      "method": body.get("method", "content-aware"),
                      "prompt": body.get("prompt", "")}

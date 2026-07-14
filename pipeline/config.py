@@ -113,6 +113,20 @@ class Config:
     auto_bg_neutral_chroma: float = float(os.environ.get("PIPELINE_AUTOBG_CHROMA", "12"))
     auto_bg_wrinkle_thresh: float = float(os.environ.get("PIPELINE_AUTOBG_WRINKLE", "4.0"))
 
+    # Object storage. backend "local" keeps everything under `root` (the default).
+    # backend "s3" mirrors the durable artifacts (RAW archive, previews, outputs,
+    # thumbnails, erase masks, sidecars) to any S3-compatible service — AWS S3, MinIO,
+    # Cloudflare R2, Backblaze B2, DigitalOcean Spaces… — configured by URL + API keys.
+    # The local tree then acts as a cache: files are uploaded after being produced and
+    # re-downloaded on demand when the cache is cold (e.g. a fresh container).
+    storage_backend: str = os.environ.get("PIPELINE_STORAGE", "local")
+    s3_endpoint: str = os.environ.get("S3_ENDPOINT_URL", "")
+    s3_access_key: str = os.environ.get("S3_ACCESS_KEY", "")
+    s3_secret_key: str = os.environ.get("S3_SECRET_KEY", "")
+    s3_bucket: str = os.environ.get("S3_BUCKET", "photoraw")
+    s3_region: str = os.environ.get("S3_REGION", "")
+    s3_prefix: str = os.environ.get("S3_PREFIX", "").strip("/")
+
     # ComfyUI (used only for generative background replacement)
     comfyui_url: str = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
     comfyui_timeout: int = int(os.environ.get("COMFYUI_TIMEOUT", "600"))

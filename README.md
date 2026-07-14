@@ -3,7 +3,48 @@
 Watch folder → SQLite queue → RAW preview extraction → AI vision analysis → RAW develop
 (16-bit TIFF) → deterministic retouch → publish/archive with a decision log.
 
-## Setup
+## Deploy with Docker Compose
+
+For a server deployment, `docker compose` runs the web UI and the worker from one image,
+with all durable artifacts on an S3-compatible bucket:
+
+```bash
+cp .env.example .env        # set ANTHROPIC_API_KEY, PIPELINE_WEBUI_PASSWORD, S3_* creds
+docker compose up -d --build            # webui on :8765 + worker watching ./inbox
+```
+
+- **webui** — the review UI, customer share links, and render jobs (`http://host:8765`).
+  Set `PIPELINE_WEBUI_PASSWORD` — the container listens on `0.0.0.0`, so without it the
+  operator UI is open to the network (it warns on boot). Share links keep their own passwords.
+- **worker** — watches the mounted `./inbox` for new RAWs and runs analyze → develop → retouch.
+- Both share the `data` volume (SQLite queue + local file cache) and the `models` volume
+  (rembg weights). Drop RAW files into `./inbox` on the host.
+
+### Object storage (S3-compatible)
+
+Set `PIPELINE_STORAGE=s3` and the `S3_*` variables to mirror every durable artifact — the RAW
+archive, previews, final outputs, thumbnails, erase masks, and RapidRaw sidecars — to any S3
+API (AWS S3, MinIO, Cloudflare R2, Backblaze B2, DigitalOcean Spaces…). Files are uploaded as
+they are produced and re-downloaded on demand, so the local `data` volume is just a cache: lose
+it (or start a fresh container) and the bucket repopulates it. Keys mirror the tree, optionally
+under `S3_PREFIX` (e.g. `output/IMG_1.jpg` → `s3://bucket/<prefix>/output/IMG_1.jpg`). The
+16-bit scratch TIFFs in `work/` are never uploaded — they are rebuildable from the RAW.
+
+Need storage in the same stack? A **MinIO** service is included behind a compose profile:
+
+```bash
+docker compose --profile local-s3 up -d       # MinIO on :9000 (console :9001), bucket auto-created
+# then in .env: S3_ENDPOINT_URL=http://minio:9000
+```
+
+With `PIPELINE_STORAGE=local` (the default) everything stays on the volume and no S3/boto3 is
+used — the same code path, storage calls become no-ops.
+
+> Design note: single-host compose doesn't need Postgres or an external auth service, so the app
+> keeps SQLite (on a volume) and its built-in per-link/PBKDF2 auth. The seams are isolated
+> (`pipeline/storage.py`, `db.connect`) if you later outgrow one host.
+
+## Setup (bare-metal / development)
 
 Already done on this machine: a `venv/` with all Python deps, and exiftool 13.59 installed
 to `~/.local/bin` (no root needed). To recreate elsewhere:

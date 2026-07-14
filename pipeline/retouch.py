@@ -1190,8 +1190,10 @@ def _load_erase_mask(name: str, shape: tuple) -> np.ndarray | None:
     if not path.is_absolute():
         path = CONFIG.root / "masks" / path
     if not path.exists():
-        log.warning("Erase mask %s not found — skipping erase", path)
-        return None
+        from .storage import STORAGE          # cold cache: mask may live in object storage
+        if STORAGE.get(path) is None:
+            log.warning("Erase mask %s not found — skipping erase", path)
+            return None
     m = np.array(Image.open(path).convert("L")).astype(np.float32) / 255.0
     m = cv2.resize(m, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
     return m if m.max() > 0.05 else None

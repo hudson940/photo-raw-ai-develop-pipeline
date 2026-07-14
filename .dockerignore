@@ -1,0 +1,11 @@
+venv/
+data/
+models/
+ComfyUI/
+.git/
+.claude/
+__pycache__/
+**/__pycache__/
+*.pyc
+.env
+data.db

@@ -14,6 +14,7 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 from .config import CONFIG
+from .storage import STORAGE
 
 log = logging.getLogger("preview")
 
@@ -96,14 +97,11 @@ def make_preview(raw_path: Path) -> Path:
         # a path that does NOT exist yet — darktable-cli refuses to overwrite
         # an existing file and silently exports to <name>_01.jpg instead
         tmp_path = Path(tmp_dir) / "full.jpg"
-        if _extract_with_exiftool(raw_path, tmp_path):
-            _downscale(tmp_path, dest)
-            return dest
-        log.info("No embedded preview in %s, decoding the RAW directly", raw_path.name)
-        if _render_with_rawpy(raw_path, tmp_path):
-            _downscale(tmp_path, dest)
-            return dest
-        if _render_with_darktable(raw_path, tmp_path):
-            _downscale(tmp_path, dest)
-            return dest
+        for produce in (_extract_with_exiftool, _render_with_rawpy, _render_with_darktable):
+            if produce is _render_with_rawpy:
+                log.info("No embedded preview in %s, decoding the RAW directly", raw_path.name)
+            if produce(raw_path, tmp_path):
+                _downscale(tmp_path, dest)
+                STORAGE.put(dest)
+                return dest
     raise PreviewError(f"Could not produce a preview for {raw_path}")

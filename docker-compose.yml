@@ -1,0 +1,89 @@
+# PhotoRAW — docker compose deployment
+#
+#   cp .env.example .env      # fill in API keys, passwords, S3 credentials
+#   docker compose up -d --build
+#
+# Services:
+#   webui   review UI + customer share links + render jobs   -> http://host:8765
+#   worker  inbox watcher + AI analysis + develop/retouch (drop RAWs in ./inbox)
+#   minio   optional S3-compatible storage for self-contained deployments:
+#           docker compose --profile local-s3 up -d
+#           (point S3_ENDPOINT_URL=http://minio:9000 in .env)
+#
+# webui and worker share the /data volume (SQLite DB + local file cache) and the
+# /models volume (rembg weights). With PIPELINE_STORAGE=s3 every durable artifact
+# (RAW archive, previews, outputs, thumbs, masks) is mirrored to the S3 service,
+# so the data volume is a rebuildable cache — the bucket is the source of truth.
+
+services:
+  webui:
+    build: .
+    image: photoraw:latest
+    restart: unless-stopped
+    command: python -m pipeline.webui --host 0.0.0.0
+    env_file: .env
+    ports:
+      - "${WEBUI_PORT:-8765}:8765"
+    volumes:
+      - data:/data
+      - models:/models
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8765/api/defaults')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    build: .
+    image: photoraw:latest
+    restart: unless-stopped
+    command: python -m pipeline.run --wb camera
+    env_file: .env
+    volumes:
+      - data:/data
+      - models:/models
+      # drop RAW files here from the host; the watcher picks them up
+      - ${INBOX_DIR:-./inbox}:/data/inbox
+
+  # --- optional: self-hosted S3 (MinIO) ------------------------------------
+  # Skip this profile when using an external S3 service (AWS, R2, B2, Spaces…).
+  minio:
+    profiles: ["local-s3"]
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY in .env}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}
+    ports:
+      - "9000:9000"    # S3 API
+      - "9001:9001"    # web console
+    volumes:
+      - minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    profiles: ["local-s3"]
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$MINIO_USER $$MINIO_PASS &&
+      mc mb --ignore-existing local/$$BUCKET &&
+      echo 'bucket ready: '$$BUCKET"
+    environment:
+      MINIO_USER: ${S3_ACCESS_KEY}
+      MINIO_PASS: ${S3_SECRET_KEY}
+      BUCKET: ${S3_BUCKET:-photoraw}
+
+volumes:
+  data:
+  models:
+  minio:
