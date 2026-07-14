@@ -39,7 +39,7 @@ from urllib.parse import parse_qs, urlparse
 
 from PIL import Image, ImageOps
 
-from . import db
+from . import auth, db
 from .config import CONFIG
 from .redo import _DEFAULT_RETOUCH, _process_photo, _reproduce_command
 from .storage import STORAGE
@@ -84,6 +84,7 @@ _ALBUM_SCHEMA = """
 CREATE TABLE IF NOT EXISTS albums (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
+    owner TEXT,                     -- editor who owns this album (NULL = admin/shared)
     created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS album_photos (
@@ -107,6 +108,14 @@ CREATE TABLE IF NOT EXISTS album_shares (
 
 _PBKDF2_ROUNDS = 200_000
 _ADMIN_PASSWORD: str | None = None   # set from --admin-password / PIPELINE_WEBUI_PASSWORD
+
+
+def _init_album_schema(conn) -> None:
+    conn.executescript(_ALBUM_SCHEMA)
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(albums)")}
+    if "owner" not in have:
+        with conn:
+            conn.execute("ALTER TABLE albums ADD COLUMN owner TEXT")
 
 
 def _hash_password(password: str, salt_hex: str | None = None) -> tuple[str, str]:
@@ -241,7 +250,7 @@ _job_queue: "queue.Queue[str]" = queue.Queue()
 
 def submit_job(ids: list[int], overrides: dict | None, from_raw: bool, reanalyze: bool,
                subject_only: bool = False, skin_exposure: bool = False,
-               share: str | None = None) -> dict:
+               share: str | None = None, user: str | None = None) -> dict:
     job = {
         "id": uuid.uuid4().hex[:8],
         "ids": ids,
@@ -251,6 +260,7 @@ def submit_job(ids: list[int], overrides: dict | None, from_raw: bool, reanalyze
         "subject_only": subject_only,
         "skin_exposure": skin_exposure,
         "share": share,               # token of the share link that queued it, if any
+        "user": user,                 # operator username that queued it (multi-tenancy)
         "state": "queued",
         "cancel": False,
         "created_at": time.time(),
@@ -273,7 +283,7 @@ def _job_public(job: dict) -> dict:
         "overrides": job["overrides"], "from_raw": job["from_raw"],
         "reanalyze": job["reanalyze"], "subject_only": job["subject_only"],
         "skin_exposure": job["skin_exposure"], "share": job.get("share"),
-        "created_at": job["created_at"],
+        "user": job.get("user"), "created_at": job["created_at"],
         "started_at": job["started_at"], "finished_at": job["finished_at"],
         "items": {str(k): v for k, v in job["items"].items()},
     }
@@ -355,15 +365,22 @@ def _thumb_path(row) -> Path | None:
     return thumb
 
 
-def _list_photos(conn) -> list[dict]:
-    rows = conn.execute(
-        "SELECT id, filename, state, confidence, updated_at, preview_path, analysis_json"
-        " FROM photos ORDER BY id"
-    ).fetchall()
+def _list_photos(conn, owner: str | None = None) -> list[dict]:
+    """List photos, optionally scoped to a single owner (editor multi-tenancy).
+    owner=None means no filter (super admin / auth disabled)."""
+    sql = ("SELECT id, filename, state, confidence, updated_at, preview_path,"
+           " analysis_json, owner, quality_json, selected FROM photos")
+    params: tuple = ()
+    if owner is not None:
+        sql += " WHERE owner = ?"
+        params = (owner,)
+    sql += " ORDER BY id"
+    rows = conn.execute(sql, params).fetchall()
     photos = []
     for r in rows:
         analysis = json.loads(r["analysis_json"]) if r["analysis_json"] else {}
         rp = analysis.get("retouch") or {}
+        quality = json.loads(r["quality_json"]) if r["quality_json"] else None
         out = _output_path(r["id"], r["filename"])
         has_output = STORAGE.exists(out)
         photos.append({
@@ -371,6 +388,10 @@ def _list_photos(conn) -> list[dict]:
             "filename": r["filename"],
             "state": r["state"],
             "confidence": r["confidence"],
+            "owner": r["owner"],
+            "selected": r["selected"],
+            "quality_flags": (quality or {}).get("flags") or [],
+            "quality_reason": (quality or {}).get("reason") or "",
             "is_portrait": bool(rp.get("is_portrait")),
             "scene": (analysis.get("scene_description") or "")[:160],
             "has_analysis": bool(r["analysis_json"]),
@@ -379,6 +400,15 @@ def _list_photos(conn) -> list[dict]:
             "has_preview": bool(r["preview_path"] and STORAGE.exists(Path(r["preview_path"]))),
         })
     return photos
+
+
+def _photo_visible(row, user: dict | None) -> bool:
+    """Editors may only touch their own photos; super admin (or auth-off) sees all."""
+    if row is None:
+        return False
+    if user is None or auth.is_super_admin(user):
+        return True
+    return row["owner"] == user["username"]
 
 
 def _photo_detail(conn, photo_id: int) -> dict | None:
@@ -409,12 +439,23 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # route access logs to logging (debug level)
         log.debug("%s %s", self.address_string(), fmt % args)
 
+    @property
+    def _extra_headers(self) -> list:
+        if not hasattr(self, "_extra"):
+            self._extra: list = []
+        return self._extra
+
+    def _emit_extra(self) -> None:
+        for k, v in self._extra_headers:
+            self.send_header(k, v)
+
     def _json(self, payload, status: int = 200) -> None:
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self._emit_extra()
         self.end_headers()
         self.wfile.write(body)
 
@@ -424,6 +465,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "max-age=31536000, immutable" if cache else "no-store")
+        self._emit_extra()
         self.end_headers()
         self.wfile.write(data)
 
@@ -458,7 +500,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _admin_ok(self) -> bool:
-        """Gate for the operator UI/API. Open unless --admin-password is set."""
+        """Password-fallback gate (no Keycloak): open unless --admin-password is set."""
         if not _ADMIN_PASSWORD:
             return True
         pw = self._basic_password()
@@ -466,6 +508,53 @@ class Handler(BaseHTTPRequestHandler):
             return True
         self._unauthorized("PhotoRAW operator")
         return False
+
+    def _cookies(self) -> dict:
+        jar = {}
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k:
+                jar[k] = v
+        return jar
+
+    def _set_session_cookie(self, token: str) -> None:
+        secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+        self._extra_headers.append(
+            ("Set-Cookie",
+             f"pr_session={token}; HttpOnly; SameSite=Lax; Path=/; "
+             f"Max-Age={CONFIG.session_ttl_s}{secure}"))
+
+    def _clear_session_cookie(self) -> None:
+        self._extra_headers.append(
+            ("Set-Cookie", "pr_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"))
+
+    def _current_user(self) -> dict | None:
+        """The logged-in operator, or None. Keycloak: from the session cookie.
+        No Keycloak but a password set: Basic-auth acts as an implicit super admin.
+        Neither: open dev mode -> implicit super admin."""
+        if auth.enabled():
+            return auth.read_session(self._cookies().get("pr_session"))
+        if _ADMIN_PASSWORD:
+            pw = self._basic_password()
+            if pw is None or not hmac.compare_digest(pw, _ADMIN_PASSWORD):
+                return None
+        return {"username": "admin", "name": "Administrator", "roles": [auth.SUPER_ADMIN]}
+
+    def _require_operator(self) -> dict | None:
+        """Return the current operator or answer 401 and return None."""
+        user = self._current_user()
+        if user is not None:
+            return user
+        if auth.enabled() or not _ADMIN_PASSWORD:
+            self._error(401, "authentication required")   # SPA shows the login form
+        else:
+            self._unauthorized("PhotoRAW operator")        # Basic-auth challenge
+        return None
+
+    @staticmethod
+    def _owner_scope(user: dict) -> str | None:
+        """Owner filter for queries: None for super admin (see all), else the username."""
+        return None if auth.is_super_admin(user) else user["username"]
 
     def _share_auth(self, token: str):
         """Return the share row when the Basic-auth password matches, else answer
@@ -503,28 +592,48 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if m := re.fullmatch(r"/share/([A-Za-z0-9_-]+)(/.*)?", url.path):
                 return self._share_get(m.group(1), m.group(2) or "/", url)
-            if not self._admin_ok():
-                return
+            # --- public (no session needed) ---
             if url.path in ("/", "/index.html"):
                 return self._file(_HTML_PATH, "text/html; charset=utf-8")
+            if url.path == "/api/me":
+                user = self._current_user()
+                return self._json({"authenticated": user is not None, "auth": auth.enabled(),
+                                   "user": user})
+            # --- operator (session/password required) ---
+            user = self._require_operator()
+            if user is None:
+                return
+            owner = self._owner_scope(user)
             if url.path == "/api/photos":
-                return self._json({"photos": _list_photos(self._conn())})
+                return self._json({"photos": _list_photos(self._conn(), owner)})
             if m := re.fullmatch(r"/api/photos/(\d+)", url.path):
-                detail = _photo_detail(self._conn(), int(m.group(1)))
-                return self._json(detail) if detail else self._error(404, "photo not found")
+                row = _photo_row(self._conn(), int(m.group(1)))
+                if not _photo_visible(row, user):
+                    return self._error(404, "photo not found")
+                return self._json(_photo_detail(self._conn(), int(m.group(1))))
             if url.path == "/api/defaults":
                 return self._json({"retouch": _DEFAULT_RETOUCH})
             if url.path == "/api/albums":
-                return self._albums_list()
+                return self._albums_list(owner)
             if m := re.fullmatch(r"/api/albums/(\d+)", url.path):
-                return self._album_detail(int(m.group(1)))
+                return self._album_detail(int(m.group(1)), user)
+            if url.path == "/api/users":
+                return self._users_list(user)
             if url.path == "/api/jobs":
+                uname = None if auth.is_super_admin(user) else user["username"]
                 with _jobs_lock:
-                    jobs = sorted(_jobs.values(), key=lambda j: j["created_at"], reverse=True)
-                    return self._json({"jobs": [_job_public(j) for j in jobs[:30]]})
+                    jobs = [j for j in _jobs.values()
+                            if j.get("share") is None
+                            and (uname is None or j.get("user") == uname)]
+                jobs.sort(key=lambda j: j["created_at"], reverse=True)
+                return self._json({"jobs": [_job_public(j) for j in jobs[:30]]})
             if m := re.fullmatch(r"/thumb/(\d+)", url.path):
+                if not _photo_visible(_photo_row(self._conn(), int(m.group(1))), user):
+                    return self._error(404, "no image for this photo yet")
                 return self._serve_thumb(int(m.group(1)), url)
             if m := re.fullmatch(r"/img/(\d+)", url.path):
+                if not _photo_visible(_photo_row(self._conn(), int(m.group(1))), user):
+                    return self._error(404, "no image for this photo yet")
                 return self._serve_img(int(m.group(1)), url)
             return self._error(404, "not found")
         except BrokenPipeError:
@@ -559,8 +668,8 @@ class Handler(BaseHTTPRequestHandler):
             photos = [p for p in _list_photos(conn) if p["id"] in decisions]
             for p in photos:
                 p["decision"] = decisions[p["id"]]
-                p.pop("scene", None)
-                p.pop("confidence", None)
+                for k in ("scene", "confidence", "owner", "selected"):
+                    p.pop(k, None)
             return self._json({"photos": photos})
         if m := re.fullmatch(r"/thumb/(\d+)", sub):
             pid = int(m.group(1))
@@ -595,30 +704,144 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if m := re.fullmatch(r"/share/([A-Za-z0-9_-]+)(/.+)", url.path):
                 return self._share_post(m.group(1), m.group(2))
-            if not self._admin_ok():
+            # --- public auth endpoints ---
+            if url.path == "/auth/login":
+                return self._login()
+            if url.path == "/auth/logout":
+                self._clear_session_cookie()
+                return self._json({"ok": True})
+            # --- operator (session/password required) ---
+            user = self._require_operator()
+            if user is None:
                 return
             if url.path == "/api/redo":
-                return self._redo()
+                return self._redo(user=user)
             if m := re.fullmatch(r"/api/photos/(\d+)/erase", url.path):
-                return self._erase(int(m.group(1)))
+                return self._erase(int(m.group(1)), user=user)
+            if m := re.fullmatch(r"/api/photos/(\d+)/select", url.path):
+                return self._set_selected(int(m.group(1)), user)
+            if m := re.fullmatch(r"/api/photos/(\d+)/process", url.path):
+                return self._force_process(int(m.group(1)), user)
             if url.path == "/api/albums":
-                return self._album_create()
+                return self._album_create(user)
             if m := re.fullmatch(r"/api/albums/(\d+)/photos", url.path):
-                return self._album_edit_photos(int(m.group(1)))
+                return self._album_edit_photos(int(m.group(1)), user)
             if m := re.fullmatch(r"/api/albums/(\d+)/delete", url.path):
-                return self._album_delete(int(m.group(1)))
+                return self._album_delete(int(m.group(1)), user)
             if m := re.fullmatch(r"/api/albums/(\d+)/shares", url.path):
-                return self._share_create(int(m.group(1)))
+                return self._share_create(int(m.group(1)), user)
             if m := re.fullmatch(r"/api/shares/([A-Za-z0-9_-]+)/revoke", url.path):
-                return self._share_revoke(m.group(1))
+                return self._share_revoke(m.group(1), user)
             if m := re.fullmatch(r"/api/jobs/([0-9a-f]+)/cancel", url.path):
                 return self._job_cancel(m.group(1), share_token=None)
+            # --- user management (super admin only) ---
+            if url.path == "/api/users":
+                return self._user_create(user)
+            if m := re.fullmatch(r"/api/users/([0-9a-f-]+)/role", url.path):
+                return self._user_role(m.group(1), user)
+            if m := re.fullmatch(r"/api/users/([0-9a-f-]+)/enabled", url.path):
+                return self._user_enabled(m.group(1), user)
+            if m := re.fullmatch(r"/api/users/([0-9a-f-]+)/delete", url.path):
+                return self._user_delete(m.group(1), user)
             return self._error(404, "not found")
         except BrokenPipeError:
             pass
         except Exception as exc:
             log.exception("POST %s failed", self.path)
             self._error(500, str(exc))
+
+    # --- auth endpoints -------------------------------------------------
+    def _login(self) -> None:
+        if not auth.enabled():
+            return self._error(400, "Keycloak login is not configured on this server")
+        body = self._read_json() or {}
+        username, password = str(body.get("username", "")), str(body.get("password", ""))
+        if not username or not password:
+            return self._error(400, "username and password required")
+        try:
+            user = auth.login(username, password)
+        except auth.AuthError as exc:
+            return self._error(401, str(exc))
+        self._set_session_cookie(auth.make_session(user))
+        self._json({"ok": True, "user": user})
+
+    def _require_super_admin(self, user: dict) -> bool:
+        if auth.is_super_admin(user):
+            return True
+        self._error(403, "super admin only")
+        return False
+
+    def _users_list(self, user: dict) -> None:
+        if not self._require_super_admin(user):
+            return
+        if not auth.enabled():
+            return self._json({"users": [], "auth": False})
+        try:
+            return self._json({"users": auth.list_users(), "auth": True})
+        except auth.AuthError as exc:
+            return self._error(502, str(exc))
+
+    def _user_create(self, user: dict) -> None:
+        if not self._require_super_admin(user):
+            return
+        body = self._read_json() or {}
+        try:
+            created = auth.create_user(
+                str(body.get("username", "")).strip(), str(body.get("password", "")),
+                body.get("role", auth.EDITOR), str(body.get("email", "")).strip(),
+                temporary=bool(body.get("temporary")))
+        except auth.AuthError as exc:
+            return self._error(400, str(exc))
+        self._json({"ok": True, "user": created}, 201)
+
+    def _user_role(self, uid: str, user: dict) -> None:
+        if not self._require_super_admin(user):
+            return
+        try:
+            auth.set_user_role(uid, (self._read_json() or {}).get("role", ""))
+        except auth.AuthError as exc:
+            return self._error(400, str(exc))
+        self._json({"ok": True})
+
+    def _user_enabled(self, uid: str, user: dict) -> None:
+        if not self._require_super_admin(user):
+            return
+        try:
+            auth.set_user_enabled(uid, bool((self._read_json() or {}).get("enabled", True)))
+        except auth.AuthError as exc:
+            return self._error(400, str(exc))
+        self._json({"ok": True})
+
+    def _user_delete(self, uid: str, user: dict) -> None:
+        if not self._require_super_admin(user):
+            return
+        try:
+            auth.delete_user(uid)
+        except auth.AuthError as exc:
+            return self._error(400, str(exc))
+        self._json({"ok": True})
+
+    # --- operator photo actions -----------------------------------------
+    def _set_selected(self, photo_id: int, user: dict) -> None:
+        row = _photo_row(self._conn(), photo_id)
+        if not _photo_visible(row, user):
+            return self._error(404, "photo not found")
+        val = {"select": 1, "deselect": 0, "clear": None}.get(
+            (self._read_json() or {}).get("selected"), "bad")
+        if val == "bad":
+            return self._error(400, "selected must be select, deselect or clear")
+        db.set_state(self._conn(), photo_id, row["state"], selected=val)
+        self._json({"ok": True, "photo_id": photo_id, "selected": val})
+
+    def _force_process(self, photo_id: int, user: dict) -> None:
+        """Force a quality-rejected (or any) photo through develop despite the gate,
+        by queueing a render with re-analysis (which bypasses the worker's quality gate)."""
+        row = _photo_row(self._conn(), photo_id)
+        if not _photo_visible(row, user):
+            return self._error(404, "photo not found")
+        job = submit_job([photo_id], None, from_raw=True, reanalyze=True,
+                         user=user["username"])
+        self._json({"job": _job_public(job)}, 202)
 
     def _job_cancel(self, job_id: str, share_token: str | None) -> None:
         with _jobs_lock:
@@ -670,7 +893,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "not found")
 
     def _redo(self, share_token: str | None = None,
-              allowed_ids: set[int] | None = None) -> None:
+              allowed_ids: set[int] | None = None, user: dict | None = None) -> None:
         body = self._read_json()
         if body is None:
             return self._error(400, "invalid JSON body")
@@ -688,6 +911,11 @@ class Handler(BaseHTTPRequestHandler):
         missing = [i for i in ids if _photo_row(conn, i) is None]
         if missing:
             return self._error(400, f"unknown photo ids: {missing}")
+        # editors may only redo their own photos
+        if user is not None and not auth.is_super_admin(user):
+            outside = [i for i in ids if not _photo_visible(_photo_row(conn, i), user)]
+            if outside:
+                return self._error(403, f"not your photos: {outside}")
         overrides = normalize_overrides(body.get("overrides") or {})
         job = submit_job(ids, overrides,
                          from_raw=bool(body.get("from_raw")),
@@ -695,10 +923,11 @@ class Handler(BaseHTTPRequestHandler):
                          reanalyze=bool(body.get("reanalyze")) and share_token is None,
                          subject_only=bool(body.get("subject_only")),
                          skin_exposure=bool(body.get("skin_exposure")),
-                         share=share_token)
+                         share=share_token, user=(user or {}).get("username"))
         self._json({"job": _job_public(job)}, 202)
 
-    def _erase(self, photo_id: int, share_token: str | None = None) -> None:
+    def _erase(self, photo_id: int, share_token: str | None = None,
+               user: dict | None = None) -> None:
         """Save an operator-drawn erase mask (data-URL PNG, white = remove) for a photo
         and start a single-photo render with it. {"clear": true} removes a saved mask."""
         body = self._read_json()
@@ -706,6 +935,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, "invalid JSON body")
         row = _photo_row(self._conn(), photo_id)
         if row is None:
+            return self._error(404, "photo not found")
+        if user is not None and not _photo_visible(row, user):
             return self._error(404, "photo not found")
 
         masks_dir = CONFIG.root / "masks"
@@ -729,14 +960,20 @@ class Handler(BaseHTTPRequestHandler):
         if not body.get("render", True):
             return self._json({"ok": True, "erase": erase})
         job = submit_job([photo_id], overrides, from_raw=False, reanalyze=False,
-                         share=share_token)
+                         share=share_token, user=(user or {}).get("username"))
         self._json({"job": _job_public(job)}, 202)
 
     # --- albums (operator) -------------------------------------------------
-    def _albums_list(self) -> None:
+    def _albums_list(self, owner: str | None = None) -> None:
         conn = self._conn()
         albums = []
-        for a in conn.execute("SELECT * FROM albums ORDER BY id DESC"):
+        sql = "SELECT * FROM albums"
+        params: tuple = ()
+        if owner is not None:
+            sql += " WHERE owner = ?"
+            params = (owner,)
+        sql += " ORDER BY id DESC"
+        for a in conn.execute(sql, params):
             c = conn.execute(
                 "SELECT COUNT(*) AS n, COALESCE(SUM(decision=1),0) AS sel,"
                 " COALESCE(SUM(decision=0),0) AS dis FROM album_photos WHERE album_id=?",
@@ -751,11 +988,19 @@ class Handler(BaseHTTPRequestHandler):
                            "shares": shares})
         self._json({"albums": albums})
 
-    def _album_detail(self, album_id: int) -> None:
-        conn = self._conn()
+    def _album_owned(self, conn, album_id: int, user: dict):
+        """Fetch an album row the user may access, else None (after writing 404)."""
         a = conn.execute("SELECT * FROM albums WHERE id=?", (album_id,)).fetchone()
+        if a is None or (not auth.is_super_admin(user) and a["owner"] != user["username"]):
+            self._error(404, "album not found")
+            return None
+        return a
+
+    def _album_detail(self, album_id: int, user: dict) -> None:
+        conn = self._conn()
+        a = self._album_owned(conn, album_id, user)
         if a is None:
-            return self._error(404, "album not found")
+            return
         photos = [{"photo_id": r["photo_id"], "decision": r["decision"],
                    "decided_at": r["decided_at"]}
                   for r in conn.execute(
@@ -763,7 +1008,13 @@ class Handler(BaseHTTPRequestHandler):
                       (album_id,))]
         self._json({"id": a["id"], "name": a["name"], "photos": photos})
 
-    def _album_create(self) -> None:
+    def _owned_ids(self, conn, ids: list[int], user: dict) -> list[int]:
+        """Keep only photo ids the user may use (all, for super admin)."""
+        if auth.is_super_admin(user):
+            return ids
+        return [i for i in ids if _photo_visible(_photo_row(conn, i), user)]
+
+    def _album_create(self, user: dict) -> None:
         body = self._read_json()
         if body is None:
             return self._error(400, "invalid JSON body")
@@ -775,33 +1026,40 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             return self._error(400, "photo_ids must be a list of integers")
         conn = self._conn()
+        ids = self._owned_ids(conn, ids, user)          # can't album someone else's photos
         now = time.time()
         with conn:
-            cur = conn.execute("INSERT INTO albums (name, created_at) VALUES (?, ?)",
-                               (name, now))
+            cur = conn.execute("INSERT INTO albums (name, owner, created_at) VALUES (?, ?, ?)",
+                               (name, self._owner_scope(user), now))
             album_id = cur.lastrowid
             conn.executemany(
-                "INSERT OR IGNORE INTO album_photos (album_id, photo_id, added_at)"
-                " VALUES (?,?,?)",
-                [(album_id, pid, now) for pid in ids])
+                "INSERT OR IGNORE INTO album_photos (album_id, photo_id, decision, added_at)"
+                " VALUES (?,?,?,?)",
+                [(album_id, pid, self._default_decision(conn, pid), now) for pid in ids])
         log.info("Album #%d %r created with %d photo(s)", album_id, name, len(ids))
         self._json({"id": album_id, "name": name, "count": len(ids)}, 201)
 
-    def _album_edit_photos(self, album_id: int) -> None:
+    @staticmethod
+    def _default_decision(conn, photo_id: int):
+        """Photos the operator/quality gate marked not-selected start discarded in albums."""
+        row = conn.execute("SELECT selected FROM photos WHERE id=?", (photo_id,)).fetchone()
+        return 0 if (row and row["selected"] == 0) else None
+
+    def _album_edit_photos(self, album_id: int, user: dict) -> None:
         body = self._read_json()
         if body is None:
             return self._error(400, "invalid JSON body")
         conn = self._conn()
-        if conn.execute("SELECT 1 FROM albums WHERE id=?", (album_id,)).fetchone() is None:
-            return self._error(404, "album not found")
-        add = [int(i) for i in body.get("add") or []]
+        if self._album_owned(conn, album_id, user) is None:
+            return
+        add = self._owned_ids(conn, [int(i) for i in body.get("add") or []], user)
         remove = [int(i) for i in body.get("remove") or []]
         now = time.time()
         with conn:
             conn.executemany(
-                "INSERT OR IGNORE INTO album_photos (album_id, photo_id, added_at)"
-                " VALUES (?,?,?)",
-                [(album_id, pid, now) for pid in add])
+                "INSERT OR IGNORE INTO album_photos (album_id, photo_id, decision, added_at)"
+                " VALUES (?,?,?,?)",
+                [(album_id, pid, self._default_decision(conn, pid), now) for pid in add])
             conn.executemany(
                 "DELETE FROM album_photos WHERE album_id=? AND photo_id=?",
                 [(album_id, pid) for pid in remove])
@@ -809,23 +1067,23 @@ class Handler(BaseHTTPRequestHandler):
                          (album_id,)).fetchone()["n"]
         self._json({"ok": True, "count": n})
 
-    def _album_delete(self, album_id: int) -> None:
+    def _album_delete(self, album_id: int, user: dict) -> None:
         conn = self._conn()
+        if self._album_owned(conn, album_id, user) is None:
+            return
         with conn:
             conn.execute("DELETE FROM album_photos WHERE album_id=?", (album_id,))
             conn.execute("DELETE FROM album_shares WHERE album_id=?", (album_id,))
-            cur = conn.execute("DELETE FROM albums WHERE id=?", (album_id,))
-        if cur.rowcount == 0:
-            return self._error(404, "album not found")
+            conn.execute("DELETE FROM albums WHERE id=?", (album_id,))
         self._json({"ok": True})
 
-    def _share_create(self, album_id: int) -> None:
+    def _share_create(self, album_id: int, user: dict) -> None:
         body = self._read_json()
         if body is None:
             return self._error(400, "invalid JSON body")
         conn = self._conn()
-        if conn.execute("SELECT 1 FROM albums WHERE id=?", (album_id,)).fetchone() is None:
-            return self._error(404, "album not found")
+        if self._album_owned(conn, album_id, user) is None:
+            return
         password = str(body.get("password") or "")
         if len(password) < 4:
             return self._error(400, "password must be at least 4 characters")
@@ -842,12 +1100,15 @@ class Handler(BaseHTTPRequestHandler):
         log.info("Share link for album #%d created (%s)", album_id, permission)
         self._json({"token": token, "url": f"/share/{token}", "permission": permission}, 201)
 
-    def _share_revoke(self, token: str) -> None:
+    def _share_revoke(self, token: str, user: dict) -> None:
         conn = self._conn()
-        with conn:
-            cur = conn.execute("UPDATE album_shares SET revoked=1 WHERE token=?", (token,))
-        if cur.rowcount == 0:
+        share = conn.execute("SELECT album_id FROM album_shares WHERE token=?", (token,)).fetchone()
+        if share is None or self._album_owned(conn, share["album_id"], user) is None:
+            if share is not None:      # _album_owned already answered 404
+                return
             return self._error(404, "share link not found")
+        with conn:
+            conn.execute("UPDATE album_shares SET revoked=1 WHERE token=?", (token,))
         self._json({"ok": True})
 
     def _conn(self):
@@ -872,12 +1133,17 @@ def main() -> None:
 
     global _ADMIN_PASSWORD
     _ADMIN_PASSWORD = args.admin_password or None
-    if args.host != "127.0.0.1" and not _ADMIN_PASSWORD:
-        log.warning("Binding to %s WITHOUT --admin-password: anyone on the network can "
-                    "use the operator UI. Share links still require their passwords.", args.host)
+    if auth.enabled():
+        log.info("Auth: Keycloak at %s (realm %s) — operators log in with their accounts",
+                 CONFIG.keycloak_url, CONFIG.keycloak_realm)
+    elif _ADMIN_PASSWORD:
+        log.info("Auth: single admin password (set KEYCLOAK_URL for multi-user + roles)")
+    elif args.host != "127.0.0.1":
+        log.warning("Binding to %s with NO authentication: anyone on the network can use the "
+                    "operator UI. Set KEYCLOAK_URL or PIPELINE_WEBUI_PASSWORD.", args.host)
 
     conn = db.connect(CONFIG.db_path)
-    conn.executescript(_ALBUM_SCHEMA)
+    _init_album_schema(conn)
     conn.close()
 
     threading.Thread(target=_render_worker, daemon=True, name="render-worker").start()

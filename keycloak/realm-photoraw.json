@@ -1,0 +1,50 @@
+{
+  "realm": "photoraw",
+  "enabled": true,
+  "displayName": "PhotoRAW",
+  "loginWithEmailAllowed": false,
+  "registrationAllowed": false,
+  "roles": {
+    "realm": [
+      { "name": "super_admin", "description": "Manage users and see all photos" },
+      { "name": "editor", "description": "Develop and review only their own photos" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "photoraw-app",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "CHANGE-ME-client-secret",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": true,
+      "redirectUris": ["*"],
+      "webOrigins": ["*"]
+    }
+  ],
+  "users": [
+    {
+      "username": "admin",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "admin@photoraw.local",
+      "firstName": "Site",
+      "lastName": "Admin",
+      "requiredActions": [],
+      "credentials": [
+        { "type": "password", "value": "CHANGE-ME-admin-password", "temporary": false }
+      ],
+      "realmRoles": ["super_admin"]
+    },
+    {
+      "username": "service-account-photoraw-app",
+      "enabled": true,
+      "serviceAccountClientId": "photoraw-app",
+      "clientRoles": {
+        "realm-management": ["manage-users", "view-users", "query-users", "view-realm"]
+      }
+    }
+  ]
+}

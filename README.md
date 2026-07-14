@@ -40,9 +40,47 @@ docker compose --profile local-s3 up -d       # MinIO on :9000 (console :9001), 
 With `PIPELINE_STORAGE=local` (the default) everything stays on the volume and no S3/boto3 is
 used — the same code path, storage calls become no-ops.
 
-> Design note: single-host compose doesn't need Postgres or an external auth service, so the app
-> keeps SQLite (on a volume) and its built-in per-link/PBKDF2 auth. The seams are isolated
-> (`pipeline/storage.py`, `db.connect`) if you later outgrow one host.
+> Design note: the pipeline's own queue/albums stay on SQLite (on a volume) — single-host compose
+> doesn't need Postgres for them. Operator identity is the exception: it's delegated to Keycloak
+> (below), which brings its own Postgres. Customer share links keep their built-in per-link PBKDF2
+> auth. The seams are isolated (`pipeline/storage.py`, `pipeline/auth.py`, `db.connect`).
+
+### Operator authentication & users (Keycloak)
+
+The operator UI supports three modes, chosen by configuration:
+
+| Config | Who can use it |
+| --- | --- |
+| `KEYCLOAK_URL` set | Multi-user login with roles + the in-app **Users** panel (recommended) |
+| only `PIPELINE_WEBUI_PASSWORD` set | A single shared admin password (HTTP Basic) |
+| neither | Open — local dev only |
+
+With Keycloak, operators sign in through an **in-app form** (no redirect): the app exchanges the
+credentials with Keycloak (direct grant) and issues a signed, stateless session cookie. Two realm
+roles:
+
+- **super_admin** — everything, plus the **Users** panel (create users, set role editor/super_admin,
+  enable/disable, delete — all backed by Keycloak's Admin API).
+- **editor** — the full develop toolset, but **scoped to their own photos**: an editor only sees,
+  opens, redoes, erases, albums, and shares photos they own. Ownership comes from the inbox
+  subfolder a RAW arrives in — `inbox/<username>/shot.CR3` belongs to `<username>`; files dropped
+  in the inbox root are shared/admin-only. Super admins see every photo.
+
+Bring up the bundled Keycloak (+ its Postgres) with the `auth` profile:
+
+```bash
+# 1. edit keycloak/realm-photoraw.json: replace CHANGE-ME-client-secret and
+#    CHANGE-ME-admin-password (the initial super admin is username "admin").
+# 2. set KEYCLOAK_* / SESSION_SECRET / KC_* in .env to match.
+docker compose --profile auth up -d
+```
+
+The realm import creates the `photoraw` realm, the `super_admin`/`editor` roles, the confidential
+`photoraw-app` client (direct grant + a service account with the `manage-users`/`view-users`/
+`query-users`/`view-realm` roles the Users panel needs), and the initial `admin` super user. New
+users created from the panel are ready to log in immediately (email/profile auto-completed).
+Prefer an existing Keycloak? Point `KEYCLOAK_URL` at it and import the same realm file. Put HTTPS
+in front in production — session cookies are marked `Secure` behind `X-Forwarded-Proto: https`.
 
 ## Setup (bare-metal / development)
 
@@ -335,6 +373,20 @@ To re-analyze in bulk through the queue, requeue with a fresh analysis and drain
 ```bash
 python -m pipeline.run --once --requeue-stuck --reanalyze   # re-analyze stuck photos
 ```
+
+## Quality gate (auto-reject bad shots)
+
+Before spending AI analysis + develop on a photo, a deterministic OpenCV check runs on its
+preview and flags shots not worth processing — **blurry** (variance-of-Laplacian focus),
+**underexposed** (dark + crushed shadows), **overexposed** (bright + blown highlights). Flagged
+photos are parked in a **`rejected`** state, **default to not-selected**, and skip the expensive
+stages. They still appear in the gallery (dimmed, with a ⚠ badge and a `rejected` filter); an
+operator can **Process anyway** from the lightbox to force one through, and when a rejected photo
+is added to an album it starts as *discarded*.
+
+Tune or disable via env: `PIPELINE_QUALITY_GATE=0` turns it off; `PIPELINE_QUALITY_BLUR_MIN`,
+`PIPELINE_QUALITY_DARK_MAX`, `PIPELINE_QUALITY_BRIGHT_MIN`, `PIPELINE_QUALITY_CLIP_FRAC` set the
+thresholds (defaults are tuned for the ~1536px preview).
 
 ## Web UI (review & batch redo)
 

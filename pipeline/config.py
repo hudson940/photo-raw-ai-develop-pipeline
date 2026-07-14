@@ -113,6 +113,20 @@ class Config:
     auto_bg_neutral_chroma: float = float(os.environ.get("PIPELINE_AUTOBG_CHROMA", "12"))
     auto_bg_wrinkle_thresh: float = float(os.environ.get("PIPELINE_AUTOBG_WRINKLE", "4.0"))
 
+    # Authentication (operator UI). When KEYCLOAK_URL is set, the UI requires a login
+    # (in-app form -> Keycloak direct-grant -> signed session cookie) and enforces roles
+    # (super_admin manages users + sees all photos; editor sees only their own). When it
+    # is not set, auth falls back to the optional PIPELINE_WEBUI_PASSWORD (single admin)
+    # or, if that is also unset, stays open (local dev). Customer share links are separate.
+    keycloak_url: str = os.environ.get("KEYCLOAK_URL", "").rstrip("/")
+    keycloak_realm: str = os.environ.get("KEYCLOAK_REALM", "photoraw")
+    keycloak_client_id: str = os.environ.get("KEYCLOAK_CLIENT_ID", "photoraw-app")
+    keycloak_client_secret: str = os.environ.get("KEYCLOAK_CLIENT_SECRET", "")
+    # Signs the stateless session cookie. Set a stable value in prod so sessions survive
+    # restarts / multiple webui replicas; a random per-process default is used otherwise.
+    session_secret: str = os.environ.get("SESSION_SECRET", "")
+    session_ttl_s: int = int(os.environ.get("SESSION_TTL", str(12 * 3600)))
+
     # Object storage. backend "local" keeps everything under `root` (the default).
     # backend "s3" mirrors the durable artifacts (RAW archive, previews, outputs,
     # thumbnails, erase masks, sidecars) to any S3-compatible service — AWS S3, MinIO,

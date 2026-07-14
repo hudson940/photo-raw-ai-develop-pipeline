@@ -109,6 +109,33 @@
                        white-space:nowrap;flex:1;min-width:80px}
   .albrow code{background:#0b0d11;border:1px solid var(--line);padding:2px 7px;
                border-radius:6px;font-size:11px}
+
+  /* ---------- quality flags ---------- */
+  .qbadge{font-size:10.5px;padding:2px 7px;border-radius:999px;border:1px solid var(--warn);
+          color:var(--warn);text-transform:capitalize}
+  .card.notsel .imgwrap{opacity:.5}
+  .card.notsel{border-style:dashed}
+  .qtip{color:var(--warn);font-size:12px;margin:2px 0}
+
+  /* ---------- auth: login + user chip + users panel ---------- */
+  #login{position:fixed;inset:0;z-index:100;background:var(--bg);display:flex;
+         align-items:center;justify-content:center}
+  #login .card2{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+                padding:28px 26px;width:min(360px,92vw);box-shadow:0 10px 40px rgba(0,0,0,.5)}
+  #login h1{margin:0 0 4px;font-size:20px}#login h1 span{color:var(--accent)}
+  #login p{color:var(--dim);margin:0 0 18px;font-size:13px}
+  #login label{display:block;font-size:12.5px;color:var(--dim);margin:10px 0 4px}
+  #login input{width:100%}
+  #login button{width:100%;margin-top:18px;padding:9px}
+  #login .err{color:var(--err);font-size:12.5px;margin-top:12px;min-height:16px}
+  #userchip{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--dim)}
+  #userchip b{color:var(--text)}
+  .roletag{font-size:10px;padding:1px 7px;border-radius:999px;border:1px solid var(--accent);
+           color:var(--accent);text-transform:uppercase;letter-spacing:.4px}
+  #um table{width:100%;border-collapse:collapse;font-size:13px}
+  #um th,#um td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line)}
+  #um th{color:var(--dim);font-weight:600;font-size:11.5px;text-transform:uppercase}
+  #um .muted{color:var(--dim)}
   #lb aside{width:340px;max-height:82vh;overflow:auto;background:var(--panel);
             border:1px solid var(--line);border-radius:8px;padding:10px;font-size:12px}
   #lb aside pre{white-space:pre-wrap;word-break:break-word;color:var(--dim);margin:6px 0}
@@ -173,6 +200,22 @@
 </head>
 <body>
 
+<!-- login (Keycloak, in-app form) -->
+<div id="login" class="hidden">
+  <div class="card2">
+    <h1>Photo<span>RAW</span></h1>
+    <p>Sign in to continue</p>
+    <form id="loginform">
+      <label>Username</label>
+      <input id="loginuser" type="text" autocomplete="username" autofocus>
+      <label>Password</label>
+      <input id="loginpass" type="password" autocomplete="current-password">
+      <button class="primary" type="submit">Sign in</button>
+      <div class="err" id="loginerr"></div>
+    </form>
+  </div>
+</div>
+
 <header>
   <h1 id="apptitle">Photo<span>RAW</span> review</h1>
   <select id="albumsel" class="op-only" title="view an album">
@@ -184,8 +227,10 @@
   <button id="selall" class="ghost dev-only">Select all</button>
   <button id="selnone" class="ghost dev-only">Clear</button>
   <button id="albbtn" class="op-only">Albums…</button>
+  <button id="usersbtn" class="op-only hidden">Users…</button>
   <button id="jobsbtn" class="dev-only">Jobs</button>
   <button id="redobtn" class="primary dev-only" disabled>Redo selected…</button>
+  <span id="userchip" class="op-only hidden"></span>
 </header>
 
 <main id="grid"></main>
@@ -208,6 +253,7 @@
       <button id="lbcrop" class="dev-only">Crop</button>
       <button id="lberase" class="dev-only">Erase objects</button>
       <button id="lbparams" class="dev-only">Params</button>
+      <button id="lbprocess" class="dev-only hidden" title="develop this photo despite the quality gate">Process anyway</button>
       <button id="lbredo" class="primary dev-only">Redo this…</button>
       <button id="lbprev">←</button><button id="lbnext">→</button>
       <button id="lbclose">✕</button>
@@ -296,6 +342,19 @@
   </div>
 </div>
 
+<!-- users panel (super admin) -->
+<div id="um" class="overlay hidden">
+  <div style="background:var(--panel);border:1px solid var(--line);border-radius:12px;
+       width:min(720px,96vw);max-height:90vh;display:flex;flex-direction:column">
+    <div style="display:flex;align-items:center;gap:10px;padding:14px 18px;
+         border-bottom:1px solid var(--line)">
+      <h2 style="margin:0;font-size:15px">Users</h2><span class="spacer"></span>
+      <button id="umclose" class="ghost">✕</button>
+    </div>
+    <div id="umbody" style="overflow:auto;padding:14px 18px"></div>
+  </div>
+</div>
+
 <!-- jobs drawer -->
 <div id="jobs" class="hidden">
   <div class="jhead"><b>Render jobs</b><span class="spacer"></span>
@@ -310,8 +369,9 @@ const state = {
   photos: [], selected: new Set(), filter: "all", search: "",
   jobs: [], lbId: null, lbOrig: false, lastClickIdx: null,
   wizStep: 0, detail: null, defaults: null,
-  albums: [], albumView: null,
+  albums: [], albumView: null, me: null, authEnabled: false,
 };
+function isSuperAdmin(){ return !!(state.me && (state.me.roles||[]).includes("super_admin")); }
 
 /* Share mode: the server injects window.SHARE = {prefix, permission, album} when this
    page is served through /share/<token>. All API calls are then prefixed, and the UI is
@@ -437,6 +497,24 @@ async function postDecision(id, decision){
     if(state.lbId===id) refreshLightbox();
   }catch(e){ alert("Could not save your choice: "+e.message); }
 }
+async function operatorSelect(id, kind){
+  try{
+    const r = await fetch(`/api/photos/${id}/select`,{method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify({selected:kind})});
+    if(!r.ok) throw new Error((await r.json()).error||r.status);
+    const p = state.photos.find(x=>x.id===id);
+    if(p) p.selected = kind==="select"?1:kind==="deselect"?0:null;
+    renderGrid();
+    if(state.lbId===id) refreshLightbox();
+  }catch(e){ alert("Could not update selection: "+e.message); }
+}
+async function forceProcess(id){
+  try{
+    const r = await fetch(`/api/photos/${id}/process`,{method:"POST"});
+    if(!r.ok) throw new Error((await r.json()).error||r.status);
+    openJobs(); pollJobs(true);
+  }catch(e){ alert("Could not process: "+e.message); }
+}
 function visiblePhotos(){
   const q = state.search.trim().toLowerCase();
   return state.photos.filter(p=>{
@@ -465,7 +543,7 @@ function renderChips(){
   } else {
     const counts = {all: state.photos.length};
     for(const p of state.photos) counts[p.state]=(counts[p.state]||0)+1;
-    const order = ["all","done","retouched","developed","analyzed","previewed","pending","review","failed"];
+    const order = ["all","done","retouched","developed","analyzed","previewed","pending","rejected","review","failed"];
     html = order.filter(s=>counts[s]).map(s=>
       `<span class="chip ${state.filter===s?"on":""}" data-f="${s}">${s} ${counts[s]||0}</span>`).join("");
   }
@@ -479,16 +557,22 @@ function renderGrid(){
   if(!vis.length){ grid.innerHTML = `<div id="empty">No photos match.</div>`; updateSel(); return; }
   grid.innerHTML = vis.map(p=>{
     const d = decisionMode() ? decisionOf(p) : null;
+    const qbadge = (!SHARE && p.quality_flags && p.quality_flags.length)
+      ? `<span class="qbadge" title="${esc(p.quality_reason||'')}">⚠ ${esc(p.quality_flags[0])}</span>` : "";
     const tail = SHARE
       ? `<span class="decide"><button class="dsel${d===1?" on":""}" data-d="select"
            title="keep this photo">✓</button><button class="ddis${d===0?" on":""}"
            data-d="discard" title="discard this photo">✗</button></span>`
       : (state.albumView
           ? `${d===1?'<span class="badge done">✓</span>':d===0?'<span class="badge failed">✗</span>':""}
-             <span class="badge ${p.state}">${p.state}</span>`
-          : `<span class="badge ${p.state}">${p.state}</span>`);
+             ${qbadge}<span class="badge ${p.state}">${p.state}</span>`
+          : `${qbadge}<span class="badge ${p.state}">${p.state}</span>
+             <span class="decide" title="operator selection">
+               <button class="dsel${p.selected===1?" on":""}" data-sel="select">✓</button>
+               <button class="ddis${p.selected===0?" on":""}" data-sel="deselect">✗</button></span>`);
+    const notsel = (!SHARE && !state.albumView && p.selected===0) ? " notsel" : "";
     return `
-    <div class="card ${state.selected.has(p.id)?"sel":""}" data-id="${p.id}">
+    <div class="card ${state.selected.has(p.id)?"sel":""}${notsel}" data-id="${p.id}">
       <input type="checkbox" class="ck dev-only" ${state.selected.has(p.id)?"checked":""}>
       <div class="imgwrap">${p.has_output||p.has_preview
         ? `<img loading="lazy" src="${API}/thumb/${p.id}?v=${p.output_mtime}" alt="">`
@@ -505,10 +589,15 @@ function renderGrid(){
     card.querySelector(".ck").addEventListener("click",e=>{
       e.stopPropagation(); toggleSel(id, e.shiftKey, vis);
     });
-    card.querySelectorAll(".decide button").forEach(b=>b.addEventListener("click",e=>{
+    card.querySelectorAll(".decide button[data-d]").forEach(b=>b.addEventListener("click",e=>{
       e.stopPropagation();
       const p = state.photos.find(x=>x.id===id), cur = decisionOf(p), kind = b.dataset.d;
       postDecision(id, (kind==="select"&&cur===1)||(kind==="discard"&&cur===0) ? "clear" : kind);
+    }));
+    card.querySelectorAll(".decide button[data-sel]").forEach(b=>b.addEventListener("click",e=>{
+      e.stopPropagation();
+      const p = state.photos.find(x=>x.id===id), kind = b.dataset.sel;
+      operatorSelect(id, (kind==="select"&&p.selected===1)||(kind==="deselect"&&p.selected===0) ? "clear" : kind);
     }));
     card.querySelector(".imgwrap").addEventListener("click",()=>openLightbox(id));
   });
@@ -559,7 +648,10 @@ function refreshLightbox(){
     $("#lbdsel").classList.toggle("on", d===1);
     $("#lbddis").classList.toggle("on", d===0);
   }
+  const lbp = $("#lbprocess");
+  if(lbp) lbp.classList.toggle("hidden", SHARE || p.state!=="rejected");
 }
+const _lbproc = $("#lbprocess"); if(_lbproc) _lbproc.onclick = ()=>forceProcess(state.lbId);
 $("#lbdsel").onclick = ()=>{ const p=state.photos.find(x=>x.id===state.lbId);
   postDecision(state.lbId, decisionOf(p)===1 ? "clear" : "select"); };
 $("#lbddis").onclick = ()=>{ const p=state.photos.find(x=>x.id===state.lbId);
@@ -1313,7 +1405,106 @@ document.addEventListener("keydown",e=>{
     if(e.key==="ArrowRight")lbStep(1);
   }
 });
-loadPhotos(); pollJobs(); loadAlbums();
+/* ================= auth ================= */
+async function bootstrap(){
+  if(SHARE){ startApp(); return; }          // share links carry their own auth
+  let me;
+  try{ me = await (await fetch("/api/me")).json(); }
+  catch(e){ me = {authenticated:false, auth:false}; }
+  state.authEnabled = !!me.auth;
+  if(me.authenticated){ state.me = me.user; showUser(); startApp(); return; }
+  if(me.auth){ $("#login").classList.remove("hidden"); }  // Keycloak: in-app form
+  else { startApp(); }        // password mode: browser Basic-auth prompt on first API call
+}
+function showUser(){
+  if(!state.me || !state.authEnabled) return;   // chip + user mgmt only with Keycloak
+  const roles = (state.me.roles||[]).map(r=>`<span class="roletag">${r.replace("_"," ")}</span>`).join(" ");
+  $("#userchip").innerHTML = `<b>${esc(state.me.name||state.me.username)}</b> ${roles}
+    <button id="logout" class="ghost" style="padding:3px 9px">Sign out</button>`;
+  $("#userchip").classList.remove("hidden");
+  $("#usersbtn").classList.toggle("hidden", !isSuperAdmin());
+  const lo = $("#logout"); lo.onclick = async ()=>{
+    await fetch("/auth/logout",{method:"POST"}); location.reload(); };
+}
+function startApp(){ loadPhotos(); pollJobs(); loadAlbums(); }
+$("#loginform").onsubmit = async (e)=>{
+  e.preventDefault();
+  $("#loginerr").textContent = "";
+  const btn = $("#loginform button"); btn.disabled = true;
+  try{
+    const r = await fetch("/auth/login",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({username:$("#loginuser").value, password:$("#loginpass").value})});
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.error||"sign-in failed");
+    location.reload();
+  }catch(err){ $("#loginerr").textContent = err.message; btn.disabled = false; }
+};
+
+/* ================= users panel (super admin) ================= */
+$("#usersbtn").onclick = async ()=>{ await renderUsers(); $("#um").classList.remove("hidden"); };
+$("#umclose").onclick = ()=>$("#um").classList.add("hidden");
+async function renderUsers(){
+  const body = $("#umbody");
+  body.innerHTML = `<div class="muted">Loading…</div>`;
+  let data;
+  try{ data = await (await fetch("/api/users")).json(); }
+  catch(e){ body.innerHTML = `<div class="err">Could not load users.</div>`; return; }
+  if(data.error){ body.innerHTML = `<div class="err">${esc(data.error)}</div>`; return; }
+  const rows = (data.users||[]).map(u=>`
+    <tr data-id="${u.id}">
+      <td><b>${esc(u.username)}</b>${u.enabled?"":' <span class="muted">(disabled)</span>'}</td>
+      <td class="muted">${esc(u.email||"")}</td>
+      <td>
+        <select class="urole">
+          <option value="editor" ${u.roles.includes("editor")?"selected":""}>editor</option>
+          <option value="super_admin" ${u.roles.includes("super_admin")?"selected":""}>super admin</option>
+        </select>
+      </td>
+      <td style="text-align:right;white-space:nowrap">
+        <button class="utoggle">${u.enabled?"Disable":"Enable"}</button>
+        <button class="udel">Delete</button>
+      </td>
+    </tr>`).join("");
+  body.innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr 130px 90px;gap:8px;align-items:end;
+         margin-bottom:14px">
+      <div><label class="muted" style="font-size:12px">Username</label>
+        <input id="nu_user" type="text" style="width:100%"></div>
+      <div><label class="muted" style="font-size:12px">Password</label>
+        <input id="nu_pass" type="text" style="width:100%" placeholder="min 6 chars"></div>
+      <div><label class="muted" style="font-size:12px">Role</label>
+        <select id="nu_role" style="width:100%"><option value="editor">editor</option>
+          <option value="super_admin">super admin</option></select></div>
+      <button id="nu_create" class="primary">Create</button>
+    </div>
+    <div class="err" id="um_err"></div>
+    <table><thead><tr><th>User</th><th>Email</th><th>Role</th><th></th></tr></thead>
+      <tbody>${rows||`<tr><td colspan="4" class="muted">No users yet.</td></tr>`}</tbody></table>`;
+  $("#nu_create").onclick = async ()=>{
+    const payload = {username:$("#nu_user").value.trim(), password:$("#nu_pass").value,
+                     role:$("#nu_role").value};
+    const r = await fetch("/api/users",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(payload)});
+    const j = await r.json();
+    if(!r.ok){ $("#um_err").textContent = j.error||"could not create user"; return; }
+    renderUsers();
+  };
+  body.querySelectorAll("tr[data-id]").forEach(tr=>{
+    const id = tr.dataset.id;
+    tr.querySelector(".urole").onchange = async (e)=>{
+      await fetch(`/api/users/${id}/role`,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({role:e.target.value})}); };
+    tr.querySelector(".utoggle").onclick = async (e)=>{
+      const enable = e.target.textContent==="Enable";
+      await fetch(`/api/users/${id}/enabled`,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({enabled:enable})}); renderUsers(); };
+    tr.querySelector(".udel").onclick = async ()=>{
+      if(!confirm("Delete this user?")) return;
+      await fetch(`/api/users/${id}/delete`,{method:"POST"}); renderUsers(); };
+  });
+}
+
+bootstrap();
 </script>
 </body>
 </html>

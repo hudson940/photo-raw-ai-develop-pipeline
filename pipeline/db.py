@@ -28,7 +28,6 @@ CREATE TABLE IF NOT EXISTS photos (
     selected INTEGER            -- operator pick: NULL undecided / 1 selected / 0 not-selected
 );
 CREATE INDEX IF NOT EXISTS idx_photos_state ON photos(state);
-CREATE INDEX IF NOT EXISTS idx_photos_owner ON photos(owner);
 """
 
 # Columns added after the first release; ALTER-ed in on connect for existing DBs.
@@ -45,6 +44,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         for col, ddl in _MIGRATIONS.items():
             if col not in have:
                 conn.execute(ddl)
+        # index on owner only after the column is guaranteed to exist
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_owner ON photos(owner)")
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
