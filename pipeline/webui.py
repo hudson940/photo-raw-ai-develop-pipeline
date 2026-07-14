@@ -41,7 +41,7 @@ from PIL import Image, ImageOps
 
 from . import auth, db
 from .config import CONFIG, RAW_EXTENSIONS
-from .redo import _DEFAULT_RETOUCH, _process_photo, _reproduce_command
+from .redo import _DEFAULT_RETOUCH, _find_raw, _process_photo, _reproduce_command
 from .storage import STORAGE
 
 log = logging.getLogger("webui")
@@ -363,6 +363,49 @@ def _image_source(row, prefer_preview: bool = False) -> Path | None:
     return None
 
 
+def _has_geometry(analysis: dict) -> bool:
+    """True if the stored develop already applies a crop or rotation."""
+    dp = (analysis or {}).get("develop") or {}
+    cr = dp.get("crop") or {}
+    cropped = all(k in cr for k in ("x", "y", "w", "h")) and not (
+        cr["x"] < 1e-3 and cr["y"] < 1e-3 and cr["w"] > 0.999 and cr["h"] > 0.999)
+    return cropped or abs(float(dp.get("rotation_deg", 0) or 0)) > 0.01
+
+
+def _base_image(row) -> Path | None:
+    """Full-frame image in the DEVELOPED orientation — the correct base for the crop/
+    straighten editor (the analysis preview can disagree with rawpy on orientation).
+
+    When the photo has no crop/rotation yet, the published render already IS the full
+    developed frame, so serve it. Otherwise re-develop the RAW with crop/rotation
+    stripped (cached) so the editor and the backend share one coordinate space."""
+    if not row["analysis_json"]:
+        return _image_source(row)
+    analysis = json.loads(row["analysis_json"])
+    if not _has_geometry(analysis):
+        return _image_source(row)          # output == full developed frame already
+    cache = CONFIG.work / f"base_{row['id']}.jpg"
+    if cache.exists():
+        return cache
+    raw = _find_raw(row)
+    if raw is None:
+        return _image_source(row)
+    import copy
+    import tempfile
+    from .develop import develop
+    from .output import _to_jpeg
+    stripped = copy.deepcopy(analysis)
+    dp = stripped.setdefault("develop", {})
+    dp["crop"] = {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "aspect": "original"}
+    dp["rotation_deg"] = 0.0
+    with tempfile.TemporaryDirectory() as tmp:
+        tiff = develop(raw, json.dumps(stripped), Path(tmp))
+        CONFIG.work.mkdir(parents=True, exist_ok=True)
+        _to_jpeg(tiff, cache, CONFIG.output_jpeg_quality)
+    log.info("Built full-frame crop base for #%d", row["id"])
+    return cache
+
+
 def _thumb_path(row) -> Path | None:
     """Return a cached thumbnail path, (re)building it if the source render is newer."""
     src = _image_source(row)
@@ -629,8 +672,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _serve_img(self, photo_id: int, url) -> None:
         row = _photo_row(self._conn(), photo_id)
-        prefer_preview = parse_qs(url.query).get("src", [""])[0] == "preview"
-        src = _image_source(row, prefer_preview) if row else None
+        which = parse_qs(url.query).get("src", [""])[0]
+        if row is None:
+            return self._error(404, "no image for this photo yet")
+        if which == "base":                       # full-frame developed image for the crop editor
+            src = _base_image(row)
+        else:
+            src = _image_source(row, prefer_preview=which == "preview")
         if src is None:
             return self._error(404, "no image for this photo yet")
         return self._file(src, "image/jpeg")

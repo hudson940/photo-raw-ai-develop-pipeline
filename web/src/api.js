@@ -44,10 +44,11 @@ export const api = {
     }),
 };
 
-export const imgUrl = (id, { preview = false, v } = {}) => {
+export const imgUrl = (id, { preview = false, base = false, v } = {}) => {
   const q = new URLSearchParams();
   if (v != null) q.set("t", v);
-  if (preview) q.set("src", "preview");
+  if (base) q.set("src", "base");        // full-frame image in developed orientation (crop editor)
+  else if (preview) q.set("src", "preview");
   const s = q.toString();
   return `${API}/img/${id}${s ? "?" + s : ""}`;
 };
