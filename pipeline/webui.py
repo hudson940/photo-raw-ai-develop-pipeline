@@ -230,6 +230,12 @@ def normalize_overrides(raw: dict) -> dict | None:
     for k in ("shadows", "highlights"):
         if din.get(k) is not None:
             dv[k] = _clamp(din[k], -100, 100)
+    if din.get("rotation_deg") is not None:
+        # straighten (fine) + 90° orientation, combined into one angle; normalize to -180..180
+        deg = float(din["rotation_deg"]) % 360.0
+        if deg > 180.0:
+            deg -= 360.0
+        dv["rotation_deg"] = round(deg, 3)
     cr = din.get("crop") or {}
     if all(k in cr for k in ("x", "y", "w", "h")):
         x = _clamp(cr["x"], 0, 1); y = _clamp(cr["y"], 0, 1)

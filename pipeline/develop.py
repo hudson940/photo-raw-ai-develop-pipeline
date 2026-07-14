@@ -181,17 +181,11 @@ def _crop_rotate(
     cx: float, cy: float, cw: float, ch: float,
     rotation_deg: float,
 ) -> np.ndarray:
-    """Crop and rotate a 0-1 or uint16 numpy image. Returns same dtype."""
-    h, w = img.shape[:2]
-
-    # Crop (fractional coordinates)
-    x1 = max(0, int(cx * w))
-    y1 = max(0, int(cy * h))
-    x2 = min(w, int((cx + cw) * w))
-    y2 = min(h, int((cy + ch) * h))
-    img = img[y1:y2, x1:x2]
-
-    # Rotation via PIL — convert to float32 to avoid PIL uint16 issues
+    """Rotate (straighten / 90° orientation, expanding the canvas) THEN crop a 0-1 or
+    uint16 image. Rotation happens first so the crop fractions are relative to the
+    *rotated* frame — exactly what the web crop editor previews. Returns same dtype."""
+    # Rotation via PIL — convert to float32 to avoid PIL uint16 issues. expand=True keeps
+    # every pixel (grows the canvas, gray-filling the corners); the crop then trims them.
     if abs(rotation_deg) > 0.01:
         was_int = img.dtype != np.float32
         if was_int:
@@ -203,6 +197,15 @@ def _crop_rotate(
         img = np.array(rotated).astype(np.float32) / 255.0
         if was_int:
             img = (np.clip(img, 0, 1) * 65535).astype(np.uint16)
+
+    # Crop (fractional coordinates of the rotated frame)
+    h, w = img.shape[:2]
+    x1 = max(0, int(cx * w))
+    y1 = max(0, int(cy * h))
+    x2 = min(w, int((cx + cw) * w))
+    y2 = min(h, int((cy + ch) * h))
+    if (x1, y1, x2, y2) != (0, 0, w, h):
+        img = img[y1:y2, x1:x2]
 
     return img
 

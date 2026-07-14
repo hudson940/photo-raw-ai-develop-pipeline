@@ -123,7 +123,8 @@ export default function Lightbox() {
           onDoubleClick={(e) => (zoom.scale > 1 ? resetZoom() : zoomAt(2.5, e.clientX, e.clientY))}>
           <img ref={imgRef} alt="" draggable={false}
             src={imgUrl(p.id, { preview: orig || mode === "crop", v: p.output_mtime })}
-            style={{ transform: `translate(${zoom.tx}px,${zoom.ty}px) scale(${zoom.scale})` }} />
+            style={{ transform: `translate(${zoom.tx}px,${zoom.ty}px) scale(${zoom.scale})`,
+              opacity: mode === "crop" ? 0 : 1 }} />
         </div>
         {showParams && detail && (
           <aside>
