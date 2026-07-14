@@ -328,3 +328,31 @@ filtering by state and filename search.
 
 The JSON API behind it (`/api/photos`, `/api/photos/<id>`, `/api/redo`, `/api/jobs`,
 `/api/photos/<id>/erase`, `/thumb/<id>`, `/img/<id>`) is plain HTTP — scriptable with `curl`.
+
+### Albums & customer share links
+
+Group photos into **albums** and send a customer a single link to proof them:
+
+1. Select photos in the gallery → **Albums…** → create an album (or add to an existing one).
+2. In the album row, set a **link password**, pick a **permission**, and *Create share link*:
+   - **select & discard only** — the customer sees just the album, with big ✓ *Select* /
+     ✗ *Discard* buttons on every photo and in the lightbox (plus zoom and the original-preview
+     compare). Nothing else: no redo, no develop tools, no other photos.
+   - **full develop** — additionally the whole develop toolset on the album's photos: the redo
+     wizard, crop, erase objects, and a jobs drawer showing *their own* render jobs only.
+     Re-running AI analysis stays operator-only (it spends API credits) and photos outside the
+     album are rejected server-side.
+3. Copy the link (`https://…/share/<token>`) and send it with the password. The link uses
+   **HTTP Basic auth** — the customer's browser asks for the password (any username); it is
+   checked against a per-link PBKDF2 hash stored in the DB. Revoke a link at any time from the
+   same dialog.
+
+Customer decisions land live in the operator UI: pick the album in the header dropdown to see
+✓/✗ badges on each photo and filter by *selected / discarded / undecided* (it auto-refreshes
+every 10 s). Counts also appear in the Albums dialog.
+
+To make links reachable, run with `--host 0.0.0.0` (or reverse-proxy). When binding beyond
+localhost, protect the operator UI too: `--admin-password ...` (or `PIPELINE_WEBUI_PASSWORD`)
+puts the whole operator surface behind HTTP Basic auth — share links keep their own passwords.
+For anything crossing the open internet, terminate TLS in front (e.g. Caddy/nginx): Basic auth
+sends the password base64-encoded, so it needs HTTPS to be private.

@@ -189,6 +189,34 @@ el asistente solo para esa foto.
 - **Panel de trabajos** — los renders corren en cola, uno a uno, por el mismo código que
   `pipeline.redo`, con progreso por foto, errores y cancelación; la galería se refresca sola.
 
+### Álbumes y enlaces para clientes
+
+Agrupa fotos en **álbumes** y envía al cliente un solo enlace para que las apruebe:
+
+1. Selecciona fotos en la galería → **Albums…** → crea un álbum (o añade a uno existente).
+2. En la fila del álbum pon una **contraseña**, elige el **permiso** y crea el enlace:
+   - **solo seleccionar y descartar** — el cliente ve únicamente el álbum, con botones grandes
+     ✓ *Seleccionar* / ✗ *Descartar* en cada foto y en la vista ampliada (más zoom y comparación
+     con el original). Nada más: sin revelado, sin herramientas, sin otras fotos.
+   - **revelado completo** — además, todas las herramientas de revelado sobre las fotos del
+     álbum: asistente de rehacer, recorte, borrado de objetos y un panel con *sus propios*
+     trabajos. Re-analizar con IA queda reservado al operador (gasta créditos de API) y las
+     fotos fuera del álbum se rechazan en el servidor.
+3. Copia el enlace (`https://…/share/<token>`) y envíalo junto con la contraseña. El enlace usa
+   **autenticación básica HTTP**: el navegador del cliente pide la contraseña (el usuario da
+   igual) y se verifica contra un hash PBKDF2 por enlace. Puedes revocar cualquier enlace desde
+   el mismo diálogo.
+
+Las decisiones del cliente aparecen en vivo en la interfaz del operador: elige el álbum en el
+desplegable de la cabecera para ver insignias ✓/✗ y filtrar por *seleccionadas / descartadas /
+sin decidir* (se refresca solo cada 10 s).
+
+Para que los enlaces sean accesibles, arranca con `--host 0.0.0.0`. Al salir de localhost
+protege también la interfaz del operador: `--admin-password ...` (o `PIPELINE_WEBUI_PASSWORD`)
+pone todo el panel del operador tras autenticación básica — los enlaces compartidos conservan
+sus propias contraseñas. Si el enlace cruza internet, pon TLS delante (Caddy/nginx): la
+autenticación básica manda la contraseña en base64 y necesita HTTPS para ser privada.
+
 ## Notas importantes
 
 - Los valores que pongas se **guardan** en la base de datos, así que se mantienen si vuelves a
