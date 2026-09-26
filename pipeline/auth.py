@@ -159,6 +159,34 @@ def is_super_admin(user: dict | None) -> bool:
     return bool(user and SUPER_ADMIN in user.get("roles", []))
 
 
+# ---------------------------------------------------------------- share sessions
+# Customer album links used to require HTTP Basic auth (the browser's native popup).
+# Instead they now log in through the app's own form, which sets this signed cookie so
+# the rest of the album loads without re-prompting. The cookie is scoped (by Path) to
+# one share token, so several album links in the same browser don't collide.
+def make_share_session(token: str) -> str:
+    payload = {"t": token, "exp": int(time.time()) + CONFIG.session_ttl_s}
+    raw = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    sig = hmac.new(_SESSION_SECRET, raw.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{raw}.{sig}"
+
+
+def read_share_session(cookie: str | None, token: str) -> bool:
+    """True if the cookie is a valid, unexpired share session for exactly this token."""
+    if not cookie or "." not in cookie:
+        return False
+    raw, _, sig = cookie.rpartition(".")
+    expect = hmac.new(_SESSION_SECRET, raw.encode(), hashlib.sha256).hexdigest()[:32]
+    if not hmac.compare_digest(sig, expect):
+        return False
+    try:
+        pad = raw + "=" * (-len(raw) % 4)
+        p = json.loads(base64.urlsafe_b64decode(pad))
+    except Exception:
+        return False
+    return p.get("t") == token and p.get("exp", 0) >= time.time()
+
+
 # ---------------------------------------------------------------- Keycloak admin API
 _svc_token = {"value": None, "exp": 0.0}
 

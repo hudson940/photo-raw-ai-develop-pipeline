@@ -98,11 +98,11 @@ class DevelopParams(BaseModel):
 
 
 class Background(BaseModel):
-    action: Literal["auto", "keep", "blur", "smooth", "studio", "replace"] = Field(
+    action: Literal["auto", "keep", "blur", "smooth", "clean", "expand", "studio", "replace"] = Field(
         description="Background handling. ALWAYS output 'keep' — background changes are made "
         "manually by the operator, never chosen automatically. (The other modes exist for the "
-        "CLI override: 'auto' picks smooth/studio/keep from the scene, 'blur' soft bokeh, "
-        "'smooth' de-wrinkle a backdrop, 'studio' neutral backdrop, 'replace' generate a new one.)"
+        "CLI override: 'auto' picks clean/keep from the scene, 'blur' soft bokeh, "
+        "'smooth' de-wrinkle a backdrop, 'clean' clean only the backdrop cloth, 'expand' rebuild the backdrop over the whole frame, 'studio' neutral backdrop, 'replace' generate a new one.)"
     )
     replace_prompt: str = Field(
         description="Short description of the new background when action='replace', "
@@ -236,7 +236,7 @@ distracting or overexposed and darkening it would help the subject stand out.
 - highlights/shadows (develop block): recover blown highlights with negative highlights, and \
 lift dark shadows with positive shadows; keep both modest unless the photo clearly needs it.
 - Background: ALWAYS set background.action = 'keep'. Do NOT change the background on your own — \
-blur/smooth/studio/replace are manual choices made by the operator via a command-line flag, not \
+blur/smooth/clean/expand/studio/replace are manual choices made by the operator via a command-line flag, not \
 something you decide. Leave replace_prompt empty.
 - If the image is not a portrait, set is_portrait=false and zero out all retouch strengths.
 - Be honest in the confidence score: dark/blurry/unreadable previews or unusual subjects \

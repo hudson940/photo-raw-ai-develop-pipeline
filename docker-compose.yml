@@ -4,32 +4,63 @@
 #   docker compose up -d --build
 #
 # Services:
+#   db      PostgreSQL — shared work-queue / albums / users metadata store
 #   webui   review UI + customer share links + render jobs   -> http://host:8765
 #   worker  inbox watcher + AI analysis + develop/retouch (drop RAWs in ./inbox)
 #   minio   optional S3-compatible storage for self-contained deployments:
 #           docker compose --profile local-s3 up -d
 #           (point S3_ENDPOINT_URL=http://minio:9000 in .env)
 #
-# webui and worker share the /data volume (SQLite DB + local file cache) and the
-# /models volume (rembg weights). With PIPELINE_STORAGE=s3 every durable artifact
-# (RAW archive, previews, outputs, thumbs, masks) is mirrored to the S3 service,
-# so the data volume is a rebuildable cache — the bucket is the source of truth.
+# webui and worker share the /data volume (local file cache) and the /models volume
+# (rembg weights), and both talk to the `db` Postgres service for metadata. With
+# PIPELINE_STORAGE=s3 every durable artifact (RAW archive, previews, outputs, thumbs,
+# masks) is mirrored to the S3 service, so the data volume is a rebuildable cache and
+# Postgres + the bucket are the source of truth. To use SQLite instead (single-node),
+# set PIPELINE_DATABASE_URL= (empty) in .env and the DB falls back to /data/pipeline.db.
 
 services:
+  # App database (work queue / albums / users metadata). Opt-in: enable with the
+  # `postgres` profile AND set PIPELINE_DATABASE_URL (see below). Without it the app
+  # uses a SQLite file on the data volume — no Postgres container needed.
+  #   docker compose --profile postgres up -d
+  db:
+    profiles: ["postgres"]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-photoraw}
+      POSTGRES_USER: ${DB_USER:-photoraw}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-photoraw}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-photoraw} -d ${DB_NAME:-photoraw}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   webui:
     build: .
     image: photoraw:latest
     restart: unless-stopped
     command: python -m pipeline.webui --host 0.0.0.0
     env_file: .env
+    # DB backend comes from PIPELINE_DATABASE_URL in .env: empty/unset -> SQLite file on
+    # the data volume; a postgresql:// URL -> Postgres (also enable the `postgres` profile).
     ports:
       - "${WEBUI_PORT:-8765}:8765"
     volumes:
       - data:/data
       - models:/models
+    depends_on:
+      db:
+        condition: service_healthy
+        required: false      # only waits when the `postgres` profile brings db up
     healthcheck:
+      # /api/me is always public (returns 200 even when Keycloak auth is required);
+      # /api/defaults needs a session once auth is on, so it can't be the health probe
       test: ["CMD", "python", "-c",
-             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8765/api/defaults')"]
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8765/api/me')"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -45,6 +76,10 @@ services:
       - models:/models
       # drop RAW files here from the host; the watcher picks them up
       - ${INBOX_DIR:-./inbox}:/data/inbox
+    depends_on:
+      db:
+        condition: service_healthy
+        required: false      # only waits when the `postgres` profile brings db up
 
   # --- optional: self-hosted auth (Keycloak + its Postgres) ----------------
   # Multi-user login with roles (super_admin / editor) and the in-app Users panel.
@@ -98,8 +133,9 @@ services:
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY in .env}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}
+      # only used when the `local-s3` profile is active; set real values in .env then
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-photoraw}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-changeme-min-io}
     ports:
       - "9000:9000"    # S3 API
       - "9001:9001"    # web console
@@ -132,3 +168,4 @@ volumes:
   models:
   minio:
   kc-db:
+  pg-data:

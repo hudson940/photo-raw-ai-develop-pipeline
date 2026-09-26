@@ -52,7 +52,7 @@ def _stage_develop(conn: sqlite3.Connection, photo_id: int, raw_path: Path, anal
 def _stage_retouch(conn: sqlite3.Connection, photo_id: int, tiff_path: Path, analysis_json: str) -> Path:
     """Run Stages 5-6: ComfyUI retouch. Returns the final image path."""
     try:
-        final_path = retouch(tiff_path, analysis_json)
+        final_path = retouch(tiff_path, analysis_json, photo_id)
         db.set_state(conn, photo_id, "retouched")
         log.info("#%d retouched ok", photo_id)
         return final_path

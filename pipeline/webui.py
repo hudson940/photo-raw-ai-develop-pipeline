@@ -9,7 +9,10 @@ Serves a single-page gallery (pipeline/webui.html) backed by a small JSON API:
     GET  /api/photos/{id}       full parameters + copy-paste reproduce command
     GET  /api/defaults          retouch defaults (used as wizard placeholders)
     GET  /thumb/{id}            cached thumbnail of the latest render
-    GET  /img/{id}              full-size latest render (?src=preview for the analysis preview)
+    GET  /img/{id}              full-size latest render (?src=preview | ?src=original)
+    POST /api/photos/{id}/deliver  choose the delivered version: developed | original
+    GET  /api/photos/{id}/download download one photo (developed or original) as attachment
+    GET  /api/download?ids=..   download several photos as a zip
     POST /api/redo              {"ids": [...], "overrides": {...}} -> starts a render job
     GET  /api/jobs              job queue with per-photo progress
     POST /api/jobs/{id}/cancel  skip a job's remaining photos
@@ -29,6 +32,7 @@ import os
 import queue
 import re
 import secrets
+import shutil
 import threading
 import time
 import uuid
@@ -40,8 +44,10 @@ from urllib.parse import parse_qs, urlparse
 from PIL import Image, ImageOps
 
 from . import auth, db
-from .config import CONFIG, RAW_EXTENSIONS
+from .config import CONFIG, JPEG_EXTENSIONS, SOURCE_EXTENSIONS, is_jpeg
+
 from .redo import _DEFAULT_RETOUCH, _find_raw, _process_photo, _reproduce_command
+from .retouch import LAYERS, layer_path
 from .storage import STORAGE
 
 log = logging.getLogger("webui")
@@ -59,6 +65,37 @@ _ASSET_TYPES = {".js": "text/javascript", ".css": "text/css", ".svg": "image/svg
                 ".map": "application/json", ".webp": "image/webp"}
 _THUMB_LONG_EDGE = 512
 _THUMB_LOCK = threading.Lock()
+
+# Download size/quality presets, largest -> smallest final file. (long-edge px, jpeg
+# quality); "high" is a passthrough (the stored full-res render, no re-encode). The reduced
+# presets decode -> downscale (never upscale) -> re-encode on demand at download time.
+_DOWNLOAD_PRESETS: dict[str, tuple[int | None, int | None]] = {
+    "high":   (None, None),   # full res, stored file as-is
+    "print":  (3508, 92),     # A4 @ 300 DPI (2480x3508)
+    "medium": (2048, 85),
+    "small":  (1200, 80),
+}
+_DEFAULT_PRESET = "high"
+
+
+def _preset_of(url) -> str:
+    """Read ?preset= from a URL, falling back to the default for missing/unknown values."""
+    p = parse_qs(url.query).get("preset", [""])[0]
+    return p if p in _DOWNLOAD_PRESETS else _DEFAULT_PRESET
+
+
+def _encode_variant(src: Path, preset: str) -> tuple[bytes, str]:
+    """Return (jpeg bytes, filename tag) for a download preset. 'high' is a passthrough."""
+    import io
+    edge, quality = _DOWNLOAD_PRESETS.get(preset, (None, None))
+    if edge is None:                       # high: no re-encode, no filename tag
+        return src.read_bytes(), ""
+    img = ImageOps.exif_transpose(Image.open(src))
+    if max(img.size) > edge:               # never upscale
+        img.thumbnail((edge, edge))
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, "JPEG", quality=quality, subsampling="4:2:0", optimize=True)
+    return buf.getvalue(), f"_{preset}"
 
 # ---------------------------------------------------------------- overrides validation
 
@@ -80,7 +117,7 @@ _FACE_KEYS = {
 }
 _SKIN_TYPES = {"auto", "fair", "light", "medium", "olive", "tan", "brown", "deep"}
 _INTENSITIES = {"subtle", "natural", "polished"}
-_BG_ACTIONS = {"auto", "keep", "blur", "smooth", "studio", "replace"}
+_BG_ACTIONS = {"auto", "keep", "blur", "smooth", "clean", "expand", "studio", "replace"}
 _CLOTH_FLOAT = {"color_pop": (0, 1), "luminance": (-1, 1), "shadows": (-1, 1),
                 "blacks": (-1, 1), "whites": (-1, 1)}
 
@@ -95,6 +132,8 @@ CREATE TABLE IF NOT EXISTS albums (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     owner TEXT,                     -- editor who owns this album (NULL = admin/shared)
+    theme TEXT,                     -- presentation theme for share pages ('default' | 'quince')
+    finalized_at REAL,              -- when the album was finalized (RAWs dropped); NULL = active
     created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS album_photos (
@@ -120,12 +159,19 @@ _PBKDF2_ROUNDS = 200_000
 _ADMIN_PASSWORD: str | None = None   # set from --admin-password / PIPELINE_WEBUI_PASSWORD
 
 
+_VALID_THEMES = ("default", "quince")
+
+
 def _init_album_schema(conn) -> None:
     conn.executescript(_ALBUM_SCHEMA)
-    have = {r["name"] for r in conn.execute("PRAGMA table_info(albums)")}
-    if "owner" not in have:
-        with conn:
+    have = conn.columns("albums")
+    with conn:
+        if "owner" not in have:
             conn.execute("ALTER TABLE albums ADD COLUMN owner TEXT")
+        if "theme" not in have:
+            conn.execute("ALTER TABLE albums ADD COLUMN theme TEXT")
+        if "finalized_at" not in have:
+            conn.execute("ALTER TABLE albums ADD COLUMN finalized_at REAL")
 
 
 def _hash_password(password: str, salt_hex: str | None = None) -> tuple[str, str]:
@@ -189,6 +235,8 @@ def normalize_overrides(raw: dict) -> dict | None:
         er["method"] = ein["method"]
     if ein.get("prompt"):
         er["prompt"] = str(ein["prompt"]).strip()[:500]
+    if ein.get("protect_subject") is not None:
+        er["protect_subject"] = bool(ein["protect_subject"])
     if er:
         r["erase"] = er
 
@@ -199,6 +247,10 @@ def normalize_overrides(raw: dict) -> dict | None:
     if bin_.get("color"):
         bg["color"] = str(bin_["color"]).strip()[:24]
         bg.setdefault("action", "studio")     # picking a color implies a studio backdrop
+    if bin_.get("backdrop_color"):
+        bg["backdrop_color"] = str(bin_["backdrop_color"]).strip()[:24]
+    if bin_.get("floor") in ("none", "water", "foil"):
+        bg["floor"] = bin_["floor"]
     if bin_.get("replace_prompt"):
         bg["replace_prompt"] = str(bin_["replace_prompt"]).strip()[:500]
     if bg:
@@ -230,6 +282,8 @@ def normalize_overrides(raw: dict) -> dict | None:
     for k in ("shadows", "highlights"):
         if din.get(k) is not None:
             dv[k] = _clamp(din[k], -100, 100)
+    if din.get("exposure_ev") is not None:
+        dv["exposure_ev"] = _clamp(din["exposure_ev"], -5, 5)
     if din.get("rotation_deg") is not None:
         # straighten (fine) + 90° orientation, combined into one angle; normalize to -180..180
         deg = float(din["rotation_deg"]) % 360.0
@@ -343,6 +397,12 @@ def _output_path(photo_id: int, filename: str) -> Path:
     return CONFIG.output / f"{Path(filename).stem}_{photo_id}.jpg"
 
 
+def _ascii_filename(name: str) -> str:
+    """Safe fallback filename for a Content-Disposition header (ASCII, no quotes)."""
+    cleaned = "".join(c if 32 <= ord(c) < 127 and c not in '"\\/' else "_" for c in name)
+    return cleaned or "photo.jpg"
+
+
 def _photo_row(conn, photo_id: int):
     return conn.execute("SELECT * FROM photos WHERE id = ?", (photo_id,)).fetchone()
 
@@ -351,11 +411,29 @@ def _photo_row_by_name(conn, filename: str):
     return conn.execute("SELECT * FROM photos WHERE filename = ?", (filename,)).fetchone()
 
 
+def _resolve_artifact(stored: str | None) -> Path | None:
+    """Resolve a stored artifact path (e.g. preview_path) to a local file, tolerating a path
+    saved under a different data root. Rows ingested when CONFIG.root was '/data' (a container)
+    keep absolute paths like '/data/previews/x.jpg'; when the app later runs with a project-
+    relative root, those don't resolve. Remap by the '<subdir>/<name>' tail under CONFIG.root."""
+    if not stored:
+        return None
+    p = Path(stored)
+    if STORAGE.exists(p):
+        return p
+    parts = p.parts
+    if len(parts) >= 2:
+        cand = CONFIG.root / parts[-2] / parts[-1]      # e.g. previews/IMG_1.jpg under the real root
+        if cand != p and STORAGE.exists(cand):
+            return cand
+    return None
+
+
 def _image_source(row, prefer_preview: bool = False) -> Path | None:
     """Best available JPEG for a photo: the published render, else the analysis preview.
     Falls back to object storage (downloading into the local cache) when configured."""
     out = _output_path(row["id"], row["filename"])
-    preview = Path(row["preview_path"]) if row["preview_path"] else None
+    preview = _resolve_artifact(row["preview_path"])
     candidates = [preview, out] if prefer_preview else [out, preview]
     for p in candidates:
         if p is not None and STORAGE.get(p) is not None:
@@ -406,6 +484,57 @@ def _base_image(row) -> Path | None:
     return cache
 
 
+def _original_image(row) -> Path | None:
+    """High-resolution rendering of the *original* capture (the RAW as shot), as an
+    alternative deliverable to the AI-developed render. This is a faithful full-res
+    decode with the camera's own white balance and default tone — none of the
+    pipeline's exposure/skin/background grading — so 'select the original' delivers
+    the untouched photo at full quality instead of the small analysis preview."""
+    cache = CONFIG.root / "originals" / f"{row['id']}.jpg"
+    if STORAGE.get(cache) is not None:
+        return cache
+    raw = _find_raw(row)
+    if raw is None:
+        return _image_source(row, prefer_preview=True)
+    try:
+        if is_jpeg(raw):                    # camera JPG: the original is the file itself
+            with Image.open(raw) as im:
+                im = ImageOps.exif_transpose(im)
+                im.load()
+        else:
+            import rawpy
+            with rawpy.imread(str(raw)) as r:
+                im = Image.fromarray(r.postprocess(use_camera_wb=True, output_bps=8,
+                                                   no_auto_bright=False))
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(".tmp.jpg")
+        im.convert("RGB").save(
+            tmp, "JPEG", quality=CONFIG.output_jpeg_quality, subsampling=CONFIG.output_jpeg_subsampling, optimize=True)
+        tmp.replace(cache)
+    except Exception as exc:
+        log.warning("original render failed for #%d (%s); using preview", row["id"], exc)
+        return _image_source(row, prefer_preview=True)
+    STORAGE.put(cache)
+    log.info("Built full-res original for #%d", row["id"])
+    return cache
+
+
+def _delivers_original(row) -> bool:
+    try:
+        return row["deliver"] == "original"
+    except (KeyError, IndexError):
+        return False
+
+
+def _deliverable(row) -> tuple[Path | None, str]:
+    """The image to hand off for a photo (download / final pick) plus a download
+    filename, honoring the per-photo developed-vs-original choice."""
+    stem = Path(row["filename"]).stem
+    if _delivers_original(row):
+        return _original_image(row), f"{stem}_original.jpg"
+    return _image_source(row), f"{stem}.jpg"
+
+
 def _thumb_path(row) -> Path | None:
     """Return a cached thumbnail path, (re)building it if the source render is newer."""
     src = _image_source(row)
@@ -431,8 +560,8 @@ def _thumb_path(row) -> Path | None:
 def _list_photos(conn, owner: str | None = None) -> list[dict]:
     """List photos, optionally scoped to a single owner (editor multi-tenancy).
     owner=None means no filter (super admin / auth disabled)."""
-    sql = ("SELECT id, filename, state, confidence, updated_at, preview_path,"
-           " analysis_json, owner, quality_json, selected FROM photos")
+    sql = ("SELECT id, filename, state, confidence, created_at, updated_at, preview_path,"
+           " analysis_json, owner, quality_json, selected, deliver, raw_removed FROM photos")
     params: tuple = ()
     if owner is not None:
         sql += " WHERE owner = ?"
@@ -451,8 +580,11 @@ def _list_photos(conn, owner: str | None = None) -> list[dict]:
             "filename": r["filename"],
             "state": r["state"],
             "confidence": r["confidence"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
             "owner": r["owner"],
             "selected": r["selected"],
+            "deliver": r["deliver"] or "developed",
             "quality_flags": (quality or {}).get("flags") or [],
             "quality_reason": (quality or {}).get("reason") or "",
             "is_portrait": bool(rp.get("is_portrait")),
@@ -460,7 +592,8 @@ def _list_photos(conn, owner: str | None = None) -> list[dict]:
             "has_analysis": bool(r["analysis_json"]),
             "has_output": has_output,
             "output_mtime": int(STORAGE.mtime(out)) if has_output else 0,
-            "has_preview": bool(r["preview_path"] and STORAGE.exists(Path(r["preview_path"]))),
+            "has_preview": _resolve_artifact(r["preview_path"]) is not None,
+            "raw_removed": bool(r["raw_removed"]),
         })
     return photos
 
@@ -474,6 +607,27 @@ def _photo_visible(row, user: dict | None) -> bool:
     return row["owner"] == user["username"]
 
 
+def _layer_info(photo_id: int) -> dict:
+    """Which background layers a photo has: the automatic one (saved by its last render)
+    and the operator's edit of it."""
+    out = {}
+    for layer in LAYERS:
+        auto, edit = layer_path(photo_id, layer), layer_path(photo_id, layer, edit=True)
+        out[layer] = {"auto": auto.exists(), "edit": edit.exists(),
+                      "mtime": auto.stat().st_mtime if auto.exists() else 0}
+    return out
+
+
+def _saved_background_action(row) -> dict:
+    """{"action": ...} of the background the photo was last rendered with (or {}). A redo
+    without a background action resets it to auto, so single-photo tools pass this along."""
+    try:
+        bg = (json.loads(row["analysis_json"] or "{}").get("retouch") or {}).get("background") or {}
+    except ValueError:
+        bg = {}
+    return {"action": bg["action"]} if bg.get("action") else {}
+
+
 def _photo_detail(conn, photo_id: int) -> dict | None:
     row = _photo_row(conn, photo_id)
     if row is None:
@@ -485,6 +639,7 @@ def _photo_detail(conn, photo_id: int) -> dict | None:
         "filename": row["filename"],
         "state": row["state"],
         "confidence": row["confidence"],
+        "deliver": row["deliver"] or "developed",
         "scene": analysis.get("scene_description") or "",
         "develop": analysis.get("develop") or {},
         "retouch": analysis["retouch"],
@@ -591,6 +746,14 @@ class Handler(BaseHTTPRequestHandler):
         self._extra_headers.append(
             ("Set-Cookie", "pr_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"))
 
+    def _set_share_cookie(self, token: str, value: str) -> None:
+        # scoped to this share link's path so multiple album links don't collide
+        secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+        self._extra_headers.append(
+            ("Set-Cookie",
+             f"pr_share={value}; HttpOnly; SameSite=Lax; Path=/share/{token}; "
+             f"Max-Age={CONFIG.session_ttl_s}{secure}"))
+
     def _current_user(self) -> dict | None:
         """The logged-in operator, or None. Keycloak: from the session cookie.
         No Keycloak but a password set: Basic-auth acts as an implicit super admin.
@@ -619,18 +782,30 @@ class Handler(BaseHTTPRequestHandler):
         """Owner filter for queries: None for super admin (see all), else the username."""
         return None if auth.is_super_admin(user) else user["username"]
 
-    def _share_auth(self, token: str):
-        """Return the share row when the Basic-auth password matches, else answer
-        401 (or 404 for an unknown/revoked link) and return None."""
-        share = self._conn().execute(
+    def _share_row(self, token: str):
+        """The live (non-revoked) share row for a token, or None. No auth side effects."""
+        return self._conn().execute(
             "SELECT * FROM album_shares WHERE token=? AND revoked=0", (token,)).fetchone()
+
+    def _share_authed(self, token: str, share) -> bool:
+        """True if this request carries a valid share session cookie for the token
+        (set by the in-app login form), or a matching HTTP Basic password (API clients)."""
+        if auth.read_share_session(self._cookies().get("pr_share"), token):
+            return True
+        pw = self._basic_password()
+        return pw is not None and _check_password(pw, share["salt"], share["password_hash"])
+
+    def _share_auth(self, token: str):
+        """Return the share row when the request is authenticated for it, else answer
+        with JSON (401 to prompt the in-app login, 404 for an unknown/revoked link) and
+        return None."""
+        share = self._share_row(token)
         if share is None:
             self._error(404, "this link is no longer valid")
             return None
-        pw = self._basic_password()
-        if pw is not None and _check_password(pw, share["salt"], share["password_hash"]):
+        if self._share_authed(token, share):
             return share
-        self._unauthorized(f"album-{token[:8]}")   # per-link realm so creds don't collide
+        self._error(401, "password required")   # SPA shows the album login form
         return None
 
     # --- routes ---------------------------------------------------------
@@ -677,11 +852,62 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, "no image for this photo yet")
         if which == "base":                       # full-frame developed image for the crop editor
             src = _base_image(row)
+        elif which == "original":                  # full-res render of the untouched RAW
+            src = _original_image(row)
         else:
             src = _image_source(row, prefer_preview=which == "preview")
         if src is None:
             return self._error(404, "no image for this photo yet")
         return self._file(src, "image/jpeg")
+
+    def _serve_download(self, row, url) -> None:
+        """Serve a photo's deliverable (developed render or original) as an attachment."""
+        src, fname = _deliverable(row)
+        if src is None:
+            return self._error(404, "no image for this photo yet")
+        data, tag = _encode_variant(src, _preset_of(url))
+        if tag:                                    # e.g. IMG_1234.jpg -> IMG_1234_medium.jpg
+            fname = f"{Path(fname).stem}{tag}{Path(fname).suffix}"
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'attachment; filename="{_ascii_filename(fname)}"')
+        self.send_header("Cache-Control", "no-store")
+        self._emit_extra()
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_zip(self, rows, preset: str = _DEFAULT_PRESET) -> None:
+        """Stream a ZIP of several photos' deliverables as one download, each re-encoded
+        to the chosen size/quality preset ('high' passes the stored files through)."""
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        used: dict[str, int] = {}
+        ztag = ""
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:  # JPEGs are already compressed
+            for row in rows:
+                src, fname = _deliverable(row)
+                if src is None:
+                    continue
+                data, tag = _encode_variant(src, preset)
+                ztag = tag
+                if tag:                            # tag the member name too (IMG_1_medium.jpg)
+                    fname = f"{Path(fname).stem}{tag}{Path(fname).suffix}"
+                # de-dupe names within the archive
+                n = used.get(fname, 0)
+                used[fname] = n + 1
+                arcname = fname if n == 0 else f"{Path(fname).stem}_{n}{Path(fname).suffix}"
+                zf.writestr(arcname, data)
+        data = buf.getvalue()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'attachment; filename="photos{ztag}.zip"')
+        self.send_header("Cache-Control", "no-store")
+        self._emit_extra()
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_GET(self) -> None:  # noqa: N802
         url = urlparse(self.path)
@@ -734,6 +960,28 @@ class Handler(BaseHTTPRequestHandler):
                 if not _photo_visible(_photo_row(self._conn(), int(m.group(1))), user):
                     return self._error(404, "no image for this photo yet")
                 return self._serve_img(int(m.group(1)), url)
+            if url.path == "/api/download":                       # bulk: ?ids=1,2,3 -> zip
+                rows = self._download_rows(parse_qs(url.query).get("ids", [""])[0], user)
+                if rows is None:
+                    return
+                return self._serve_zip(rows, _preset_of(url))
+            if m := re.fullmatch(r"/api/photos/(\d+)/download", url.path):
+                row = _photo_row(self._conn(), int(m.group(1)))
+                if not _photo_visible(row, user):
+                    return self._error(404, "photo not found")
+                return self._serve_download(row, url)
+            if m := re.fullmatch(r"/api/photos/(\d+)/layers", url.path):
+                if not _photo_visible(_photo_row(self._conn(), int(m.group(1))), user):
+                    return self._error(404, "photo not found")
+                return self._json({"layers": _layer_info(int(m.group(1)))})
+            if m := re.fullmatch(r"/api/photos/(\d+)/layer/(\w+)", url.path):
+                pid, layer = int(m.group(1)), m.group(2)
+                if not _photo_visible(_photo_row(self._conn(), pid), user) or layer not in LAYERS:
+                    return self._error(404, "no such layer")
+                path = layer_path(pid, layer, edit="edit" in parse_qs(url.query))
+                if not path.exists() and STORAGE.get(path) is None:
+                    return self._error(404, "no such layer")
+                return self._file(path, "image/png")
             return self._error(404, "not found")
         except BrokenPipeError:
             pass
@@ -742,19 +990,28 @@ class Handler(BaseHTTPRequestHandler):
             self._error(500, str(exc))
 
     def _share_get(self, token: str, sub: str, url) -> None:
-        share = self._share_auth(token)
-        if share is None:
-            return
         conn = self._conn()
-        decisions = _album_photo_decisions(conn, share["album_id"])
+        share = self._share_row(token)
+        # The SPA shell + its assets are served WITHOUT a password so the in-app album
+        # login form can render; the config tells it whether the visitor is authenticated.
         if sub in ("", "/"):
-            album = conn.execute("SELECT name FROM albums WHERE id=?",
-                                 (share["album_id"],)).fetchone()
+            album = conn.execute("SELECT name, theme FROM albums WHERE id=?",
+                                 (share["album_id"],)).fetchone() if share else None
             return self._serve_index(share_cfg={
-                "prefix": f"/share/{token}", "permission": share["permission"],
-                "album": album["name"] if album else "Album"})
+                "prefix": f"/share/{token}",
+                "permission": share["permission"] if share else "select",
+                "album": (album["name"] if album else "Album"),
+                "theme": (album["theme"] if album and album["theme"] else "default"),
+                "authed": bool(share and self._share_authed(token, share)),
+                "invalid": share is None})
         if m := re.fullmatch(r"/(assets/.+|[\w.-]+\.(?:svg|png|ico|webp|woff2?|js|css))", sub):
             return self._serve_asset(m.group(1))   # share pages load the same bundle
+        # everything else (data/images/downloads) requires the share session
+        if share is None or not self._share_authed(token, share):
+            return self._error(404 if share is None else 401,
+                               "this link is no longer valid" if share is None
+                               else "password required")
+        decisions = _album_photo_decisions(conn, share["album_id"])
         if sub == "/api/photos":
             photos = [p for p in _list_photos(conn) if p["id"] in decisions]
             for p in photos:
@@ -772,6 +1029,18 @@ class Handler(BaseHTTPRequestHandler):
             if pid not in decisions:
                 return self._error(404, "not in this album")
             return self._serve_img(pid, url)
+        if sub == "/api/download":                      # zip of album photos
+            ids = [int(i) for i in parse_qs(url.query).get("ids", [""])[0].split(",")
+                   if i.strip().isdigit() and int(i) in decisions]
+            rows = [r for r in (_photo_row(conn, i) for i in ids) if r is not None]
+            if not rows:
+                return self._error(404, "no downloadable photos")
+            return self._serve_zip(rows, _preset_of(url))
+        if m := re.fullmatch(r"/api/photos/(\d+)/download", sub):
+            pid = int(m.group(1))
+            if pid not in decisions:
+                return self._error(404, "not in this album")
+            return self._serve_download(_photo_row(conn, pid), url)
         # everything below is the develop surface
         if share["permission"] != "develop":
             return self._error(403, "this link only allows selecting or discarding photos")
@@ -811,16 +1080,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._upload(user)
             if m := re.fullmatch(r"/api/photos/(\d+)/erase", url.path):
                 return self._erase(int(m.group(1)), user=user)
+            if m := re.fullmatch(r"/api/photos/(\d+)/layer/(\w+)", url.path):
+                return self._layer_edit(int(m.group(1)), m.group(2), user=user)
             if m := re.fullmatch(r"/api/photos/(\d+)/select", url.path):
                 return self._set_selected(int(m.group(1)), user)
+            if m := re.fullmatch(r"/api/photos/(\d+)/deliver", url.path):
+                return self._set_deliver(int(m.group(1)), user)
             if m := re.fullmatch(r"/api/photos/(\d+)/process", url.path):
                 return self._force_process(int(m.group(1)), user)
+            if m := re.fullmatch(r"/api/photos/(\d+)/output", url.path):
+                return self._save_output(int(m.group(1)), user=user)
+            if m := re.fullmatch(r"/api/photos/(\d+)/delete", url.path):
+                return self._delete_photo(int(m.group(1)), user)
+            if url.path == "/api/photos/delete":
+                return self._delete_photos(user)
             if url.path == "/api/albums":
                 return self._album_create(user)
             if m := re.fullmatch(r"/api/albums/(\d+)/photos", url.path):
                 return self._album_edit_photos(int(m.group(1)), user)
+            if m := re.fullmatch(r"/api/albums/(\d+)/theme", url.path):
+                return self._album_update(int(m.group(1)), user)
             if m := re.fullmatch(r"/api/albums/(\d+)/delete", url.path):
                 return self._album_delete(int(m.group(1)), user)
+            if m := re.fullmatch(r"/api/albums/(\d+)/finalize", url.path):
+                return self._album_finalize(int(m.group(1)), user)
             if m := re.fullmatch(r"/api/albums/(\d+)/shares", url.path):
                 return self._share_create(int(m.group(1)), user)
             if m := re.fullmatch(r"/api/shares/([A-Za-z0-9_-]+)/revoke", url.path):
@@ -915,18 +1198,20 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def _upload(self, user: dict) -> None:
-        """Accept a RAW file upload and drop it in the uploader's inbox subfolder so the
-        watcher ingests it with the right owner. The raw file bytes are the request body;
-        the filename comes from ?filename=… (avoids multipart parsing in the stdlib server).
+        """Accept a photo upload and drop it in the uploader's inbox subfolder so it is
+        tracked with the right owner. The file bytes are the request body; the filename
+        comes from ?filename=… (avoids multipart parsing in the stdlib server).
+
+        RAW files and camera JPGs both enter the pipeline (queued 'pending').
         Editors upload into inbox/<username>/; super admin / open mode into the inbox root."""
-        from . import watcher
         params = parse_qs(urlparse(self.path).query)
         raw_name = (params.get("filename", [""])[0] or "").strip()
         name = Path(raw_name).name                      # strip any path components
         if not name:
             return self._error(400, "filename query parameter required")
-        if Path(name).suffix.lower() not in RAW_EXTENSIONS:
-            return self._error(415, "only RAW files are accepted (e.g. .CR3, .NEF, .ARW, .DNG)")
+        suffix = Path(name).suffix.lower()
+        if suffix not in SOURCE_EXTENSIONS:
+            return self._error(415, "only RAW files or JPG images are accepted")
         try:
             length = int(self.headers.get("Content-Length", 0))
         except ValueError:
@@ -954,15 +1239,22 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     f.write(buf)
                     remaining -= len(buf)
+            if suffix in JPEG_EXTENSIONS:
+                with open(tmp, "rb") as f:
+                    if f.read(2) != b"\xff\xd8":         # JPEG SOI marker
+                        tmp.unlink(missing_ok=True)
+                        return self._error(415, "file is not a valid JPG image")
             tmp.replace(dest)
         except Exception as exc:
             tmp.unlink(missing_ok=True)
             return self._error(500, f"upload failed: {exc}")
+
         if db.enqueue(self._conn(), dest, owner):
             log.info("Uploaded %s (owner=%s) -> queued", name, owner or "-")
-        self._json({"ok": True, "filename": name, "owner": owner}, 201)
+        self._json({"ok": True, "filename": name, "owner": owner, "state": "pending"}, 201)
 
     # --- operator photo actions -----------------------------------------
+
     def _set_selected(self, photo_id: int, user: dict) -> None:
         row = _photo_row(self._conn(), photo_id)
         if not _photo_visible(row, user):
@@ -974,15 +1266,136 @@ class Handler(BaseHTTPRequestHandler):
         db.set_state(self._conn(), photo_id, row["state"], selected=val)
         self._json({"ok": True, "photo_id": photo_id, "selected": val})
 
+    def _set_deliver(self, photo_id: int, user: dict) -> None:
+        """Choose which version of a photo is delivered/downloaded: the AI-developed
+        render ('developed', the default) or the untouched full-res original ('original')."""
+        row = _photo_row(self._conn(), photo_id)
+        if not _photo_visible(row, user):
+            return self._error(404, "photo not found")
+        deliver = (self._read_json() or {}).get("deliver")
+        if deliver not in ("developed", "original"):
+            return self._error(400, "deliver must be 'developed' or 'original'")
+        db.set_state(self._conn(), photo_id, row["state"], deliver=deliver)
+        # the full-res original is rendered + cached lazily on first /img?src=original
+        # (or /download) request, keeping this toggle instant
+        self._json({"ok": True, "photo_id": photo_id, "deliver": deliver})
+
+    def _download_rows(self, spec: str, user: dict | None) -> list | None:
+        """Resolve a comma-separated id list to visible photo rows for download,
+        or answer an error and return None."""
+        try:
+            ids = [int(i) for i in spec.split(",") if i.strip()]
+        except ValueError:
+            self._error(400, "ids must be a comma-separated list of integers")
+            return None
+        if not ids:
+            self._error(400, "no photo ids given")
+            return None
+        conn = self._conn()
+        rows = []
+        for pid in ids:
+            row = _photo_row(conn, pid)
+            if _photo_visible(row, user):
+                rows.append(row)
+        if not rows:
+            self._error(404, "no downloadable photos")
+            return None
+        return rows
+
     def _force_process(self, photo_id: int, user: dict) -> None:
         """Force a quality-rejected (or any) photo through develop despite the gate,
         by queueing a render with re-analysis (which bypasses the worker's quality gate)."""
         row = _photo_row(self._conn(), photo_id)
         if not _photo_visible(row, user):
             return self._error(404, "photo not found")
+        if row["raw_removed"]:
+            return self._error(409, "RAW removed (album finalized)")
         job = submit_job([photo_id], None, from_raw=True, reanalyze=True,
                          user=user["username"])
         self._json({"job": _job_public(job)}, 202)
+
+    def _save_output(self, photo_id: int, user: dict | None = None,
+                     share_token: str | None = None) -> None:
+        """Replace a photo's published render with an image edited in the browser (crop /
+        rotate). The request body is the new JPEG. This is a direct pixel edit — no RAW
+        re-develop / render job — so it is instant and works from a share link too."""
+        row = _photo_row(self._conn(), photo_id)
+        if row is None or (user is not None and not _photo_visible(row, user)):
+            return self._error(404, "photo not found")
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 60 * 1024 * 1024:
+            return self._error(400, "expected a JPEG body up to 60 MB")
+        data = self.rfile.read(length)
+        if data[:2] != b"\xff\xd8":                    # JPEG SOI marker
+            return self._error(415, "body must be a JPEG image")
+        out = _output_path(photo_id, row["filename"])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(".tmp.jpg")
+        tmp.write_bytes(data)
+        tmp.replace(out)
+        STORAGE.put(out)
+        # drop the cached thumbnail so it rebuilds from the new output on next request
+        thumb = CONFIG.root / "thumbs" / f"{photo_id}.jpg"
+        try:
+            STORAGE.delete(thumb)
+        except Exception:
+            pass
+        db.set_state(self._conn(), photo_id, row["state"])   # bump updated_at
+        log.info("Saved browser edit for #%d (%d bytes)", photo_id, len(data))
+        self._json({"ok": True, "photo_id": photo_id, "output_mtime": int(out.stat().st_mtime)})
+
+    def _purge_photo(self, conn, photo_id: int, user: dict) -> str | None:
+        """Delete a photo entirely: its DB row, album memberships, and every file it owns
+        (render, preview, thumbnail, original, erase mask, archived RAW, caches).
+        Returns the filename, or None if the photo isn't visible to `user`."""
+        row = _photo_row(conn, photo_id)
+        if not _photo_visible(row, user):
+            return None
+        files = [
+            _output_path(photo_id, row["filename"]),
+            Path(row["preview_path"]) if row["preview_path"] else None,
+            CONFIG.root / "thumbs" / f"{photo_id}.jpg",
+            CONFIG.root / "originals" / f"{photo_id}.jpg",
+            CONFIG.root / "masks" / f"{photo_id}.png",
+            CONFIG.work / f"base_{photo_id}.jpg",
+            CONFIG.archive / row["filename"],
+            Path(row["path"]) if row["path"] else None,
+        ]
+        for p in files:
+            if p is None:
+                continue
+            try:
+                STORAGE.delete(p)          # removes local + remote (missing is fine)
+            except Exception as exc:
+                log.warning("delete %s failed: %s", p, exc)
+        with conn:
+            conn.execute("DELETE FROM album_photos WHERE photo_id=?", (photo_id,))
+            conn.execute("DELETE FROM photos WHERE id=?", (photo_id,))
+        log.info("Deleted photo #%d (%s)", photo_id, row["filename"])
+        return row["filename"]
+
+    def _delete_photo(self, photo_id: int, user: dict) -> None:
+        if self._purge_photo(self._conn(), photo_id, user) is None:
+            return self._error(404, "photo not found")
+        self._json({"ok": True, "deleted": photo_id})
+
+    def _delete_photos(self, user: dict) -> None:
+        """Bulk delete: body {"ids": [...]}. Photos not visible to the user are skipped."""
+        body = self._read_json() or {}
+        try:
+            ids = sorted({int(i) for i in body.get("ids") or []})
+        except (TypeError, ValueError):
+            return self._error(400, "ids must be a list of photo ids")
+        if not ids:
+            return self._error(400, "no photo ids given")
+        conn = self._conn()
+        deleted, missing = [], []
+        for pid in ids:
+            (deleted if self._purge_photo(conn, pid, user) is not None else missing).append(pid)
+        self._json({"ok": True, "deleted": deleted, "missing": missing})
 
     def _job_cancel(self, job_id: str, share_token: str | None) -> None:
         with _jobs_lock:
@@ -995,7 +1408,21 @@ class Handler(BaseHTTPRequestHandler):
             job["state"] = "cancelled"
         return self._json({"ok": True, "job": _job_public(job)})
 
+    def _share_login(self, token: str) -> None:
+        """Exchange the album password for a signed share-session cookie (in-app form)."""
+        share = self._share_row(token)
+        if share is None:
+            return self._error(404, "this link is no longer valid")
+        body = self._read_json() or {}
+        pw = str(body.get("password", ""))
+        if not _check_password(pw, share["salt"], share["password_hash"]):
+            return self._error(401, "incorrect password")
+        self._set_share_cookie(token, auth.make_share_session(token))
+        self._json({"ok": True})
+
     def _share_post(self, token: str, sub: str) -> None:
+        if sub == "/login":
+            return self._share_login(token)
         share = self._share_auth(token)
         if share is None:
             return
@@ -1029,6 +1456,11 @@ class Handler(BaseHTTPRequestHandler):
             if pid not in decisions:
                 return self._error(404, "not in this album")
             return self._erase(pid, share_token=token)
+        if m := re.fullmatch(r"/api/photos/(\d+)/output", sub):
+            pid = int(m.group(1))
+            if pid not in decisions:
+                return self._error(404, "not in this album")
+            return self._save_output(pid, share_token=token)
         if m := re.fullmatch(r"/api/jobs/([0-9a-f]+)/cancel", sub):
             return self._job_cancel(m.group(1), share_token=token)
         return self._error(404, "not found")
@@ -1052,6 +1484,10 @@ class Handler(BaseHTTPRequestHandler):
         missing = [i for i in ids if _photo_row(conn, i) is None]
         if missing:
             return self._error(400, f"unknown photo ids: {missing}")
+        # RAWs are gone for finalized photos — re-developing them is impossible
+        finalized = [i for i in ids if _photo_row(conn, i)["raw_removed"]]
+        if finalized:
+            return self._error(409, f"RAW removed (album finalized): {finalized}")
         # editors may only redo their own photos
         if user is not None and not auth.is_super_admin(user):
             outside = [i for i in ids if not _photo_visible(_photo_row(conn, i), user)]
@@ -1079,6 +1515,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, "photo not found")
         if user is not None and not _photo_visible(row, user):
             return self._error(404, "photo not found")
+        if row["raw_removed"] and not body.get("clear"):
+            return self._error(409, "RAW removed (album finalized)")
 
         masks_dir = CONFIG.root / "masks"
         mask_name = f"{photo_id}.png"
@@ -1095,13 +1533,51 @@ class Handler(BaseHTTPRequestHandler):
             STORAGE.put(masks_dir / mask_name)
             erase = {"mask": mask_name,
                      "method": body.get("method", "content-aware"),
-                     "prompt": body.get("prompt", "")}
+                     "prompt": body.get("prompt", ""),
+                     "protect_subject": bool(body.get("protect_subject", False))}
 
-        overrides = normalize_overrides({"retouch": {"erase": erase}})
+        # a redo without a background action resets it to the default (auto), which could
+        # rebuild the very area just filled — keep the background the photo was rendered with
+        retouch_ov: dict = {"erase": erase}
+        if saved := _saved_background_action(row):
+            retouch_ov["background"] = saved
+        overrides = normalize_overrides({"retouch": retouch_ov})
         if not body.get("render", True):
             return self._json({"ok": True, "erase": erase})
         job = submit_job([photo_id], overrides, from_raw=False, reanalyze=False,
                          share=share_token, user=(user or {}).get("username"))
+        self._json({"job": _job_public(job)}, 202)
+
+    def _layer_edit(self, photo_id: int, layer: str, user: dict | None = None) -> None:
+        """Save the operator's correction of an automatic background layer (data-URL PNG:
+        gray = auto, white = add, black = remove) and re-render. {"clear": true} drops it."""
+        if layer not in LAYERS:
+            return self._error(404, "no such layer")
+        body = self._read_json()
+        if body is None:
+            return self._error(400, "invalid JSON body")
+        row = _photo_row(self._conn(), photo_id)
+        if row is None or (user is not None and not _photo_visible(row, user)):
+            return self._error(404, "photo not found")
+        if row["raw_removed"]:
+            return self._error(409, "RAW removed (album finalized)")
+        path = layer_path(photo_id, layer, edit=True)
+        if body.get("clear"):
+            STORAGE.delete(path)
+            path.unlink(missing_ok=True)
+        else:
+            m = re.fullmatch(r"data:image/png;base64,([A-Za-z0-9+/=\s]+)", body.get("mask") or "")
+            if not m:
+                return self._error(400, "mask must be a data:image/png;base64 URL")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(base64.b64decode(m.group(1)))
+            STORAGE.put(path)
+        if not body.get("render", True):
+            return self._json({"ok": True})
+        saved = _saved_background_action(row)
+        overrides = normalize_overrides({"retouch": {"background": saved}}) if saved else None
+        job = submit_job([photo_id], overrides, from_raw=False, reanalyze=False,
+                         user=(user or {}).get("username"))
         self._json({"job": _job_public(job)}, 202)
 
     # --- albums (operator) -------------------------------------------------
@@ -1116,8 +1592,8 @@ class Handler(BaseHTTPRequestHandler):
         sql += " ORDER BY id DESC"
         for a in conn.execute(sql, params):
             c = conn.execute(
-                "SELECT COUNT(*) AS n, COALESCE(SUM(decision=1),0) AS sel,"
-                " COALESCE(SUM(decision=0),0) AS dis FROM album_photos WHERE album_id=?",
+                "SELECT COUNT(*) AS n, COUNT(*) FILTER (WHERE decision=1) AS sel,"
+                " COUNT(*) FILTER (WHERE decision=0) AS dis FROM album_photos WHERE album_id=?",
                 (a["id"],)).fetchone()
             shares = [{"token": s["token"], "permission": s["permission"],
                        "url": f"/share/{s['token']}", "created_at": s["created_at"]}
@@ -1125,6 +1601,8 @@ class Handler(BaseHTTPRequestHandler):
                           "SELECT * FROM album_shares WHERE album_id=? AND revoked=0"
                           " ORDER BY created_at", (a["id"],))]
             albums.append({"id": a["id"], "name": a["name"], "created_at": a["created_at"],
+                           "theme": a["theme"] or "default",
+                           "finalized_at": a["finalized_at"],
                            "count": c["n"], "selected": c["sel"], "discarded": c["dis"],
                            "shares": shares})
         self._json({"albums": albums})
@@ -1147,7 +1625,21 @@ class Handler(BaseHTTPRequestHandler):
                   for r in conn.execute(
                       "SELECT * FROM album_photos WHERE album_id=? ORDER BY photo_id",
                       (album_id,))]
-        self._json({"id": a["id"], "name": a["name"], "photos": photos})
+        self._json({"id": a["id"], "name": a["name"], "theme": a["theme"] or "default",
+                    "photos": photos})
+
+    def _album_update(self, album_id: int, user: dict) -> None:
+        """Update album presentation settings (currently just the share theme)."""
+        conn = self._conn()
+        if self._album_owned(conn, album_id, user) is None:
+            return
+        body = self._read_json() or {}
+        theme = body.get("theme")
+        if theme not in _VALID_THEMES:
+            return self._error(400, f"theme must be one of {_VALID_THEMES}")
+        with conn:
+            conn.execute("UPDATE albums SET theme=? WHERE id=?", (theme, album_id))
+        self._json({"ok": True, "id": album_id, "theme": theme})
 
     def _owned_ids(self, conn, ids: list[int], user: dict) -> list[int]:
         """Keep only photo ids the user may use (all, for super admin)."""
@@ -1162,6 +1654,7 @@ class Handler(BaseHTTPRequestHandler):
         name = str(body.get("name") or "").strip()[:80]
         if not name:
             return self._error(400, "album name required")
+        theme = body.get("theme") if body.get("theme") in _VALID_THEMES else "default"
         try:
             ids = [int(i) for i in body.get("photo_ids") or []]
         except (TypeError, ValueError):
@@ -1170,9 +1663,9 @@ class Handler(BaseHTTPRequestHandler):
         ids = self._owned_ids(conn, ids, user)          # can't album someone else's photos
         now = time.time()
         with conn:
-            cur = conn.execute("INSERT INTO albums (name, owner, created_at) VALUES (?, ?, ?)",
-                               (name, self._owner_scope(user), now))
-            album_id = cur.lastrowid
+            album_id = conn.insert(
+                "INSERT INTO albums (name, owner, theme, created_at) VALUES (?, ?, ?, ?)",
+                (name, self._owner_scope(user), theme, now))
             conn.executemany(
                 "INSERT OR IGNORE INTO album_photos (album_id, photo_id, decision, added_at)"
                 " VALUES (?,?,?,?)",
@@ -1218,6 +1711,44 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute("DELETE FROM albums WHERE id=?", (album_id,))
         self._json({"ok": True})
 
+    def _album_finalize(self, album_id: int, user: dict) -> None:
+        """Finalize an album: permanently drop the RAW files for every photo in it (freeing
+        disk + S3) while keeping the developed renders, previews and thumbnails. Photos set to
+        deliver the original first get their full-res original baked into the originals cache
+        so that delivery keeps working. Marks the album finalized and each photo raw_removed."""
+        conn = self._conn()
+        a = self._album_owned(conn, album_id, user)
+        if a is None:
+            return
+        pids = [r["photo_id"] for r in conn.execute(
+            "SELECT photo_id FROM album_photos WHERE album_id=?", (album_id,))]
+        freed = 0
+        for pid in pids:
+            row = _photo_row(conn, pid)
+            if row is None or row["raw_removed"]:
+                continue
+            # preserve original delivery: build originals/{id}.jpg while the RAW still exists
+            if _delivers_original(row):
+                _original_image(row)
+            raws = [CONFIG.archive / row["filename"],
+                    CONFIG.archive / f"{row['filename']}.rrdata"]
+            if row["path"]:
+                raws.append(Path(row["path"]))
+            for p in raws:
+                try:
+                    if STORAGE.exists(p):
+                        freed += 1
+                    STORAGE.delete(p)          # local + remote, missing is fine
+                except Exception as exc:
+                    log.warning("finalize: delete %s failed: %s", p, exc)
+            with conn:
+                conn.execute("UPDATE photos SET raw_removed=1 WHERE id=?", (pid,))
+        with conn:
+            conn.execute("UPDATE albums SET finalized_at=? WHERE id=?", (time.time(), album_id))
+        log.info("Album #%d finalized: dropped RAWs for %d photo(s) (%d files)",
+                 album_id, len(pids), freed)
+        self._json({"ok": True, "finalized": len(pids), "freed_raws": freed})
+
     def _share_create(self, album_id: int, user: dict) -> None:
         body = self._read_json()
         if body is None:
@@ -1253,10 +1784,21 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def _conn(self):
-        # one short-lived connection per request; SQLite in WAL mode handles this fine
+        # one connection per HTTP connection (handler instance), opened lazily and
+        # closed in finish(). SQLite (WAL) and PostgreSQL both handle this fine.
         if not hasattr(self, "_db"):
             self._db = db.connect(CONFIG.db_path)
         return self._db
+
+    def finish(self) -> None:
+        # release the DB connection when the socket closes so PostgreSQL connections
+        # don't leak (each keep-alive HTTP connection holds one for its lifetime)
+        try:
+            if hasattr(self, "_db"):
+                self._db.close()
+        except Exception:
+            pass
+        super().finish()
 
 
 def main() -> None:

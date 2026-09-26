@@ -19,7 +19,8 @@ export default function Login() {
   return (
     <div className="login">
       <form className="box" onSubmit={submit}>
-        <h1>Photo<span>RAW</span></h1>
+        <img className="login-logo" src="/logo.png" alt="PhotoCapibara" />
+        <h1>Photo<span>Capibara</span></h1>
         <p>Sign in to continue</p>
         <label>Username</label>
         <input value={username} onChange={(e) => setU(e.target.value)} autoFocus autoComplete="username" />

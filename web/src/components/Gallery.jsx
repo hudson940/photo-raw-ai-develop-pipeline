@@ -1,12 +1,13 @@
 import React, { useMemo, useRef } from "react";
 import { useApp } from "../ctx.js";
 import { SHARE, thumbUrl } from "../api.js";
-import { visibleFilter } from "./Header.jsx";
+import { visibleFilter, sortComparator } from "./Header.jsx";
 
 export default function Gallery() {
   const app = useApp();
   const lastIdx = useRef(null);
-  const vis = useMemo(() => app.photos.filter(visibleFilter(app)), [app.photos, app.filter, app.search, app.albumView, app.decisionMode]);
+  const vis = useMemo(() => app.photos.filter(visibleFilter(app)).sort(sortComparator(app)),
+    [app.photos, app.filter, app.search, app.albumView, app.decisionMode, app.sort]);
 
   const toggleSel = (id, shift) => {
     const idx = vis.findIndex((p) => p.id === id);
@@ -72,6 +73,7 @@ function Card({ p, app, onToggle }) {
         ) : (
           <>
             <span className={"badge " + p.state}>{p.state}</span>
+            {p.deliver === "original" && <span className="badge orig" title="delivers the untouched original">original</span>}
             <span className="decide" title="operator selection">
               <button className={"sel" + (p.selected === 1 ? " on" : "")}
                 onClick={() => app.operatorSelect(p.id, p.selected === 1 ? "clear" : "select")}>✓</button>

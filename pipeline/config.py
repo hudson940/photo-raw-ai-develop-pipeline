@@ -30,6 +30,14 @@ RAW_EXTENSIONS = {
     ".dng", ".raf", ".orf", ".rw2", ".pef", ".srw", ".3fr",
     ".erf", ".kdc", ".mos", ".mrw", ".x3f", ".iiq",
 }
+# Camera JPGs run through the same pipeline (preview -> gate -> analysis -> develop ->
+# retouch); develop just skips the RAW decode and Kelvin white balance (baked in).
+JPEG_EXTENSIONS = {".jpg", ".jpeg"}
+SOURCE_EXTENSIONS = RAW_EXTENSIONS | JPEG_EXTENSIONS
+
+
+def is_jpeg(path) -> bool:
+    return Path(path).suffix.lower() in JPEG_EXTENSIONS
 
 
 def _env_path(name: str, default: Path) -> Path:
@@ -39,6 +47,15 @@ def _env_path(name: str, default: Path) -> Path:
 @dataclass
 class Config:
     root: Path = field(default_factory=lambda: _env_path("PIPELINE_ROOT", _PROJECT_ROOT / "data"))
+
+    # Work-queue database. Empty -> SQLite file under `root` (pipeline.db, the default,
+    # zero-config for single-node local use). Set a PostgreSQL URL to run the shared
+    # metadata store in Postgres instead (recommended for the Docker/multi-container
+    # deployment so webui + worker talk to one durable DB):
+    #   PIPELINE_DATABASE_URL=postgresql://user:pass@host:5432/photoraw
+    # DATABASE_URL is accepted as a fallback for the same value.
+    database_url: str = (os.environ.get("PIPELINE_DATABASE_URL")
+                         or os.environ.get("DATABASE_URL", "")).strip()
 
     # AI analysis
     model: str = os.environ.get("PIPELINE_MODEL", "deepseek-v4-flash")
@@ -75,7 +92,10 @@ class Config:
     highlight_rolloff_knee: float = float(os.environ.get("PIPELINE_HIGHLIGHT_KNEE", "0.75"))
 
     # Stage 7 — final delivery
-    output_jpeg_quality: int = int(os.environ.get("PIPELINE_JPEG_QUALITY", "90"))
+    # q97 + 4:4:4 (no chroma subsampling): smooth studio backdrops and skin gradients band or
+    # smear at q90/4:2:0. Files are larger (~2-4 MB at 3120x2080).
+    output_jpeg_quality: int = int(os.environ.get("PIPELINE_JPEG_QUALITY", "97"))
+    output_jpeg_subsampling: str = os.environ.get("PIPELINE_JPEG_SUBSAMPLING", "4:4:4")
     keep_intermediate_tiffs: bool = os.environ.get("PIPELINE_KEEP_TIFFS", "").lower() in ("1", "true", "yes")
     # RapidRaw `.rrdata` sidecar next to the archived RAW. Off by default (only useful if you
     # open the RAWs in RapidRaw); enable with PIPELINE_WRITE_RRDATA=1.
@@ -118,6 +138,18 @@ class Config:
     # exceeds the threshold. Raise the wrinkle threshold if clean backdrops get smoothed.
     auto_bg_neutral_chroma: float = float(os.environ.get("PIPELINE_AUTOBG_CHROMA", "12"))
     auto_bg_wrinkle_thresh: float = float(os.environ.get("PIPELINE_AUTOBG_WRINKLE", "4.0"))
+    # When no --background is given, run 'auto' instead of 'keep': studio backdrops are
+    # detected and expanded/cleaned (wrinkles, folds, shoe marks, visible studio around
+    # the backdrop); real scenes resolve to keep. 0 restores the old always-keep default.
+    auto_studio_background: bool = os.environ.get("PIPELINE_AUTO_STUDIO_BG", "1").lower() in ("1", "true", "yes")
+    # 'expand' backdrop rebuild: how much of the subject's real cast shadow to keep (0-1),
+    # and grain matched to the backdrop (0-2).
+    expand_shadow_strength: float = float(os.environ.get("PIPELINE_EXPAND_SHADOW", "0.6"))
+    expand_grain: float = float(os.environ.get("PIPELINE_EXPAND_GRAIN", "1.0"))
+    # 'expand' refines the extension over walls/softboxes/floor with ComfyUI inpainting (the
+    # area is pre-filled deterministically; denoise only adds cloth realism). 0 = deterministic.
+    expand_generative: bool = os.environ.get("PIPELINE_EXPAND_GENERATIVE", "1").lower() in ("1", "true", "yes")
+    expand_comfy_denoise: float = float(os.environ.get("PIPELINE_EXPAND_COMFY_DENOISE", "0.35"))
 
     # Authentication (operator UI). When KEYCLOAK_URL is set, the UI requires a login
     # (in-app form -> Keycloak direct-grant -> signed session cookie) and enforces roles
@@ -146,6 +178,12 @@ class Config:
     s3_bucket: str = os.environ.get("S3_BUCKET", "photoraw")
     s3_region: str = os.environ.get("S3_REGION", "")
     s3_prefix: str = os.environ.get("S3_PREFIX", "").strip("/")
+    # Client-side (end-to-end) encryption of object-storage payloads. When set, every
+    # file is encrypted before upload and decrypted after download, so S3 only ever
+    # holds ciphertext. A 32-byte key (base64/hex) is used as-is; anything else is
+    # treated as a passphrase and stretched with scrypt. Empty = no encryption.
+    # WARNING: losing this key makes every remote-only photo unrecoverable.
+    storage_encryption_key: str = os.environ.get("STORAGE_ENCRYPTION_KEY", "").strip()
 
     # Pre-processing quality gate (pipeline.quality). When on, blurry / badly-exposed
     # photos are detected on the preview BEFORE analysis+develop, parked in 'rejected',
@@ -157,9 +195,13 @@ class Config:
     quality_clip_frac: float = float(os.environ.get("PIPELINE_QUALITY_CLIP_FRAC", "0.30"))
 
     # ComfyUI (used only for generative background replacement)
-    comfyui_url: str = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188")
+    comfyui_url: str = os.environ.get("COMFYUI_URL", "http://127.0.0.1:8188").rstrip("/")
     comfyui_timeout: int = int(os.environ.get("COMFYUI_TIMEOUT", "600"))
     comfyui_checkpoint: str = os.environ.get("COMFYUI_CHECKPOINT", "v1-5-pruned-emaonly.safetensors")
+    # inpaint engine: "auto" uses FLUX.1 Fill (GGUF) when ComfyUI has it, else SD1.5 checkpoint
+    comfyui_engine: str = os.environ.get("COMFYUI_ENGINE", "auto").lower()
+    comfyui_flux_unet: str = os.environ.get("COMFYUI_FLUX_UNET", "flux1-fill-dev-Q8_0.gguf")
+    comfyui_flux_t5: str = os.environ.get("COMFYUI_FLUX_T5", "t5xxl_fp16.safetensors")
     skip_retouch: bool = os.environ.get("PIPELINE_SKIP_RETOUCH", "").lower() in ("1", "true", "yes")
 
     @property

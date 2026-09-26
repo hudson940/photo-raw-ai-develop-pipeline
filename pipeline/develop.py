@@ -1,11 +1,12 @@
 """Stage 4: RAW development -> 16-bit TIFF.
 
-Decodes the RAW with rawpy, applies the AI-determined develop parameters
+Decodes the RAW with rawpy (or a camera JPG with PIL), applies the AI-determined develop parameters
 (exposure, white balance, contrast, highlights/shadows, saturation/vibrance,
 crop, rotation), and exports a 16-bit TIFF ready for Stage 5 retouch or
 final delivery.
 """
 
+import io
 import json
 import logging
 import math
@@ -15,9 +16,9 @@ from pathlib import Path
 
 import numpy as np
 import tifffile
-from PIL import Image
+from PIL import Image, ImageCms, ImageOps
 
-from .config import CONFIG
+from .config import CONFIG, is_jpeg
 from .preview import find_tool
 
 log = logging.getLogger("develop")
@@ -97,10 +98,24 @@ def _apply_tint(r: float, g: float, b: float, tint: float) -> tuple[float, float
     return (r, g * factor, b)
 
 
+def _smoothstep(x: np.ndarray) -> np.ndarray:
+    """Hermite smoothstep clamped to [0, 1]: 0 at 0, 1 at 1, with zero slope at both
+    ends — so region weights fade in/out with no kink (the source of the old banding)."""
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
 def _tone_curve(img: np.ndarray, contrast: float, highlights: float, shadows: float) -> np.ndarray:
     """Apply a contrast S-curve with highlight/shadow controls.
 
     Operates on 0-1 float image. contrast in [-1, 1], highlights/shadows in [-100, 100].
+
+    Shadows/highlights use smooth, monotonic region weights so the transform never
+    inverts or plateaus. The black and white points are preserved (a shadow lift
+    never turns black gray, a highlight recovery never turns white gray), and the
+    weight fades to zero at the midtone pivot with matching slope, so smooth skin /
+    background gradients don't band. Positive = lift shadows / brighten highlights;
+    negative = crush shadows / recover highlights.
     """
     # Convert to float in 0-1
     was_int = img.dtype != np.float32
@@ -114,15 +129,20 @@ def _tone_curve(img: np.ndarray, contrast: float, highlights: float, shadows: fl
         t = (img - pivot) * (1.0 + contrast * 2.0) + pivot
         img = np.clip(t, 0, 1)
 
-    # Highlights: brighten top 30%, shadows: lift bottom 30%
-    if abs(highlights) > 0.01:
-        h_factor = highlights / 100.0
-        mask = img > 0.5
-        img[mask] = img[mask] * (1.0 + h_factor * (img[mask] - 0.5) * 2.0)
+    # Shadows: scale the lower half by a smooth weight (1 at black -> 0 at the pivot).
+    # Multiplicative, so pure black stays black and the map is monotonic.
     if abs(shadows) > 0.01:
-        s_factor = shadows / 100.0
-        mask = img < 0.5
-        img[mask] = img[mask] + s_factor * (0.5 - img[mask]) * 2.0
+        s = shadows / 100.0
+        w = 1.0 - _smoothstep(img / 0.5)
+        img = img * (1.0 + s * w)
+
+    # Highlights: work on the headroom to white (1 - img) with a smooth weight
+    # (0 at the pivot -> 1 at white). Positive shrinks the headroom (brighter),
+    # negative grows it (recover); pure white stays white and the map is monotonic.
+    if abs(highlights) > 0.01:
+        h = highlights / 100.0
+        w = _smoothstep((img - 0.5) / 0.5)
+        img = 1.0 - (1.0 - img) * (1.0 - h * w)
 
     img = np.clip(img, 0, 1)
 
@@ -210,16 +230,12 @@ def _crop_rotate(
     return img
 
 
-def develop(raw_path: Path, analysis_json: str, output_dir: Path) -> Path:
-    """Run Stage 4 development. Returns path to the exported 16-bit TIFF."""
-    analysis = json.loads(analysis_json)
-    dp = analysis["develop"]
-
+def _decode_raw(raw_path: Path) -> np.ndarray | None:
+    """RAW -> float32 gamma-encoded sRGB in [0,1], upright. None -> use darktable."""
     try:
         import rawpy
     except ImportError:
-        return _develop_with_darktable(raw_path, dp, output_dir)
-
+        return None
     try:
         with rawpy.imread(str(raw_path)) as raw:
             rgb = raw.postprocess(
@@ -234,16 +250,53 @@ def develop(raw_path: Path, analysis_json: str, output_dir: Path) -> Path:
             )
     except Exception as exc:
         log.warning("rawpy failed for %s, trying darktable: %s", raw_path.name, exc)
-        return _develop_with_darktable(raw_path, dp, output_dir)
+        return None
+    return rgb.astype(np.float32) / 65535.0
 
-    img = rgb.astype(np.float32) / 65535.0
+
+def _decode_jpeg(path: Path) -> np.ndarray:
+    """Camera JPG -> the same buffer rawpy yields: float32 gamma-encoded sRGB [0,1],
+    upright (EXIF orientation applied — PIL doesn't do it on its own like rawpy)."""
+    try:
+        with Image.open(path) as im:
+            im = ImageOps.exif_transpose(im)
+            icc = im.info.get("icc_profile")
+            if icc and im.mode in ("RGB", "CMYK"):
+                try:
+                    src = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+                    if "srgb" not in (ImageCms.getProfileDescription(src) or "").lower():
+                        im = ImageCms.profileToProfile(im, src, ImageCms.createProfile("sRGB"),
+                                                       outputMode="RGB")
+                except Exception as exc:  # broken profile: trust the pixels as sRGB
+                    log.warning("%s: ignoring ICC profile (%s)", path.name, exc)
+            rgb = np.asarray(im.convert("RGB"))
+    except Exception as exc:
+        raise DevelopError(f"Could not decode JPG {path.name}: {exc}") from exc
+    return rgb.astype(np.float32) / 255.0
+
+
+def develop(raw_path: Path, analysis_json: str, output_dir: Path) -> Path:
+    """Run Stage 4 development. Returns path to the exported 16-bit TIFF."""
+    analysis = json.loads(analysis_json)
+    dp = analysis["develop"]
+
+    jpeg = is_jpeg(raw_path)
+    if jpeg:
+        img = _decode_jpeg(raw_path)
+    else:
+        img = _decode_raw(raw_path)
+        if img is None:
+            return _develop_with_darktable(raw_path, dp, output_dir)
 
     # White balance. The RAW is already decoded with the camera's accurate as-shot
     # balance (use_camera_wb=True). Only apply an extra correction when the analysis
     # explicitly asks for a Kelvin override — otherwise we'd double-correct and skew
-    # the color, which is the classic "colors look off" bug.
+    # the color, which is the classic "colors look off" bug. A JPG's balance is baked
+    # in by the camera, so a Kelvin override is skipped there.
     wb = dp.get("white_balance", {})
-    if wb.get("mode") == "kelvin":
+    if wb.get("mode") == "kelvin" and jpeg:
+        log.info("%s: JPG source — skipping Kelvin white balance (as-shot is baked in)", raw_path.name)
+    elif wb.get("mode") == "kelvin":
         kelvin = max(2000, min(15000, int(wb.get("temp", 6500))))
         kr, kg, kb = _wb_relative_multipliers(kelvin)
         kr, kg, kb = _apply_tint(kr, kg, kb, wb.get("tint", 0))
@@ -251,9 +304,16 @@ def develop(raw_path: Path, analysis_json: str, output_dir: Path) -> Path:
         img[..., 1] *= kg
         img[..., 2] *= kb
 
-    # Exposure
+    # Exposure — apply in LINEAR light so +1 EV == 2x scene luminance. The buffer here is
+    # gamma-encoded (postprocess gamma≈2.222), and multiplying an encoded buffer directly
+    # would over-brighten (~2.2x per stop) and crush the toe; round-trip through the gamma
+    # around the multiply so a stop is a true stop.
     ev = dp.get("exposure_ev", 0.0)
-    img *= 2.0 ** ev
+    if abs(ev) > 1e-4:
+        g = 2.222
+        lin = np.clip(img, 0.0, None) ** g
+        lin *= 2.0 ** ev
+        img = lin ** (1.0 / g)
 
     # Highlight rolloff instead of a hard clip: bright skin/specular that would blow out to
     # flat white (common when auto-brighten over-lifts a low-key scene and the AI adds a bit

@@ -22,6 +22,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 from .config import CONFIG
@@ -67,6 +68,16 @@ _DEFAULT_RETOUCH = {
     "intensity": "natural",
 }
 
+# Neutral analysis used to rerun a photo that never got an AI analysis (quality-gate rejects):
+# a straight camera-WB develop with no tonal moves, so develop overrides land on a clean base.
+_DEFAULT_ANALYSIS = {
+    "develop": {"exposure_ev": 0.0, "white_balance": {"mode": "camera", "temp": 6500, "tint": 0},
+                "contrast": 0.0, "highlights": 0.0, "shadows": 0.0,
+                "saturation": 0.0, "vibrance": 0.0},
+    "retouch": {},
+    "confidence": None,
+}
+
 
 def _list_photos(conn) -> None:
     rows = conn.execute(
@@ -106,6 +117,7 @@ def _reproduce_command(photo_id: int, analysis: dict) -> str:
         parts.append(f"{flag} {_fmt(rp.get(key, 0.0))}")
 
     dp = analysis.get("develop", {})
+    parts.append(f"--exposure {_fmt(dp.get('exposure_ev', 0.0))}")
     parts.append(f"--shadows {_fmt(dp.get('shadows', 0.0))}")
     parts.append(f"--highlights {_fmt(dp.get('highlights', 0.0))}")
 
@@ -149,6 +161,8 @@ def _reproduce_command(photo_id: int, analysis: dict) -> str:
             parts.append(f"--erase-method {er['method']}")
         if er.get("prompt"):
             parts.append(f'--erase-prompt "{er["prompt"]}"')
+        if er.get("protect_subject"):
+            parts.append("--protect-subject")
 
     bg = rp.get("background", {})
     parts.append(f"--background {bg.get('action', 'keep')}")
@@ -156,6 +170,10 @@ def _reproduce_command(photo_id: int, analysis: dict) -> str:
         parts.append(f"--studio-color {bg.get('color', 'gray')}")
     if bg.get("action") == "replace" and bg.get("replace_prompt"):
         parts.append(f'--prompt "{bg["replace_prompt"]}"')
+    if bg.get("action") in ("clean", "expand", "auto") and (bg.get("backdrop_color") or "auto") != "auto":
+        parts.append(f"--backdrop-color {bg['backdrop_color']}")
+    if bg.get("floor") in ("water", "foil"):
+        parts.append(f"--floor {bg['floor']}")
 
     parts.append(f"--intensity {rp.get('intensity', 'natural')}")
 
@@ -171,8 +189,16 @@ def _reproduce_command(photo_id: int, analysis: dict) -> str:
 
 
 def _find_raw(row) -> Path | None:
-    if Path(row["path"]).exists():
-        return Path(row["path"])
+    p = Path(row["path"])
+    if p.exists():
+        return p
+    # tolerate a path saved under a different data root (e.g. '/data/inbox/x.CR3' from a
+    # container while CONFIG.root is a project-relative 'data'): remap the tail onto the root
+    parts = p.parts
+    if len(parts) >= 2:
+        cand = CONFIG.root / parts[-2] / parts[-1]
+        if cand.exists():
+            return cand
     # archived RAW — possibly only in object storage (fresh container / cold cache)
     from .storage import STORAGE
     return STORAGE.get(CONFIG.archive / row["filename"])
@@ -185,6 +211,12 @@ def _reanalyze(row) -> dict:
     from .preview import make_preview
 
     preview = Path(row["preview_path"]) if row["preview_path"] else None
+    # tolerate a preview_path saved under a different data root (e.g. '/data/previews/x.jpg'
+    # from a container) by remapping onto the current previews dir before falling back to RAW
+    if preview is not None and not preview.exists():
+        alt = CONFIG.previews / preview.name
+        if alt.exists():
+            preview = alt
     if preview is None or not preview.exists():
         raw = _find_raw(row)
         if raw is None:
@@ -261,10 +293,15 @@ def _process_photo(conn, photo_id: int, args, overrides: dict | None) -> Path:
 
     if args.reanalyze:
         analysis = _reanalyze(row)
+    elif not row["analysis_json"]:
+        # Quality-gate–rejected (or not-yet-analyzed) photos have no analysis. Rather than
+        # error, rerun them with a neutral default develop (bypassing the gate) so the user
+        # can rescue them — e.g. an underexposed reject rerun with `--exposure`/`--shadows`,
+        # which are develop params that need no AI. Pass --reanalyze to run the AI instead.
+        log.info("#%d has no analysis (state=%s) — rerunning with neutral defaults "
+                 "(pass --reanalyze for AI analysis)", photo_id, row["state"])
+        analysis = dict(_DEFAULT_ANALYSIS)
     else:
-        if not row["analysis_json"]:
-            raise RuntimeError(f"#{photo_id} has no analysis yet (state={row['state']}) — "
-                               "use --reanalyze")
         analysis = json.loads(row["analysis_json"])
     analysis["retouch"] = {**_DEFAULT_RETOUCH, **analysis.get("retouch", {})}
 
@@ -283,7 +320,7 @@ def _process_photo(conn, photo_id: int, args, overrides: dict | None) -> Path:
         CONFIG.work.mkdir(parents=True, exist_ok=True)
         tiff = develop(raw, analysis_json, CONFIG.work)
 
-    result = retouch(tiff, analysis_json)
+    result = retouch(tiff, analysis_json, photo_id)
     if result == tiff:
         log.warning("#%d nothing to retouch with these settings — output is the developed TIFF", photo_id)
 
@@ -291,8 +328,11 @@ def _process_photo(conn, photo_id: int, args, overrides: dict | None) -> Path:
     write_rapidraw_sidecar(row["filename"], analysis_json)
     cleanup_intermediates(Path(row["filename"]).stem)
     with conn:
-        conn.execute("UPDATE photos SET analysis_json = ?, confidence = ? WHERE id = ?",
-                     (analysis_json, analysis.get("confidence"), row["id"]))
+        # a published render means the photo is done — promote quality-gate rejects / review /
+        # previewed out of their holding state (and bump updated_at so the gallery refreshes)
+        conn.execute("UPDATE photos SET analysis_json = ?, confidence = ?, state = 'done',"
+                     " updated_at = ? WHERE id = ?",
+                     (analysis_json, analysis.get("confidence"), time.time(), row["id"]))
     return out_path
 
 

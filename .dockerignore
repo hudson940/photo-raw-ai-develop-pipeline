@@ -1,6 +1,8 @@
 venv/
 data/
-models/
+# ship models/ into the image (YuNet + gender ONNX + prototxt) — but not the 45 MB Caffe
+# source, which is only used offline to (re)generate gender_net.onnx
+models/gender_net.caffemodel
 ComfyUI/
 .git/
 .claude/

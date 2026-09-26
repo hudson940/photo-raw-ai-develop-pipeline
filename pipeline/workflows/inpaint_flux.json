@@ -1,0 +1,38 @@
+{
+  "description": "FLUX.1 Fill [dev] (GGUF) inpaint with crop-and-stitch: the masked area plus context is cropped from the full-res image, sampled at ~1 MP, and stitched back with a blended seam. Needs ComfyUI-GGUF + comfyui-inpaint-cropandstitch. Placeholders are filled by pipeline.retouch._comfy_inpaint.",
+  "nodes": {
+    "1": {"class_type": "LoadImage", "inputs": {"image": "__IMAGE__"}},
+    "2": {"class_type": "LoadImage", "inputs": {"image": "__MASK__"}},
+    "4": {"class_type": "ImageToMask", "inputs": {"image": ["2", 0], "channel": "red"}},
+    "20": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "__UNET__"}},
+    "21": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "__T5__", "clip_name2": "clip_l.safetensors", "type": "flux"}},
+    "22": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
+    "23": {"class_type": "DifferentialDiffusion", "inputs": {"model": ["20", 0]}},
+    "8": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["21", 0], "text": "__PROMPT__"}},
+    "9": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["8", 0]}},
+    "24": {"class_type": "FluxGuidance", "inputs": {"conditioning": ["8", 0], "guidance": 30.0}},
+    "25": {"class_type": "InpaintCropImproved", "inputs": {
+      "image": ["1", 0], "mask": ["4", 0],
+      "downscale_algorithm": "bilinear", "upscale_algorithm": "bicubic",
+      "preresize": false, "preresize_mode": "ensure minimum resolution",
+      "preresize_min_width": 1024, "preresize_min_height": 1024,
+      "preresize_max_width": 16384, "preresize_max_height": 16384,
+      "mask_fill_holes": true, "mask_expand_pixels": 8, "mask_invert": false,
+      "mask_blend_pixels": 24, "mask_hipass_filter": 0.1,
+      "extend_for_outpainting": false, "extend_up_factor": 1.0, "extend_down_factor": 1.0,
+      "extend_left_factor": 1.0, "extend_right_factor": 1.0,
+      "context_from_mask_extend_factor": 1.4,
+      "output_resize_to_target_size": true, "output_target_width": 1024, "output_target_height": 1024,
+      "output_padding": "32", "device_mode": "gpu (much faster)"}},
+    "26": {"class_type": "InpaintModelConditioning", "inputs": {
+      "positive": ["24", 0], "negative": ["9", 0], "vae": ["22", 0],
+      "pixels": ["25", 1], "mask": ["25", 2], "noise_mask": true}},
+    "6": {"class_type": "KSampler", "inputs": {
+      "model": ["23", 0], "positive": ["26", 0], "negative": ["26", 1], "latent_image": ["26", 2],
+      "seed": 42, "steps": 28, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple",
+      "denoise": "__DENOISE__"}},
+    "10": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["22", 0]}},
+    "27": {"class_type": "InpaintStitchImproved", "inputs": {"stitcher": ["25", 0], "inpainted_image": ["10", 0]}},
+    "11": {"class_type": "SaveImage", "inputs": {"images": ["27", 0], "filename_prefix": "inpainted_flux"}}
+  }
+}

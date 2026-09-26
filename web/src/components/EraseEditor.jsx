@@ -8,6 +8,7 @@ export default function EraseEditor({ photo, imgRef, onClose }) {
   const [brush, setBrush] = useState(30);
   const [method, setMethod] = useState("content-aware");
   const [prompt, setPrompt] = useState("");
+  const [protect, setProtect] = useState(true);   // keep the subject even where the brush covers it
   const [busy, setBusy] = useState(false);
   const [hasSaved, setHasSaved] = useState(false);
   const canvasRef = useRef(null);
@@ -73,7 +74,7 @@ export default function EraseEditor({ photo, imgRef, onClose }) {
     if (!strokes.current.length) { alert("Paint over the parts to remove first."); return; }
     setBusy(true);
     try {
-      await api.post(`/api/photos/${photo.id}/erase`, { mask: exportMask(), method, prompt: prompt.trim() });
+      await api.post(`/api/photos/${photo.id}/erase`, { mask: exportMask(), method, prompt: prompt.trim(), protect_subject: protect });
       onClose(); app.setJobsOpen(true); app.refreshJobs();
     } catch (e) { alert("Erase failed: " + e.message); }
     finally { setBusy(false); }
@@ -99,6 +100,9 @@ export default function EraseEditor({ photo, imgRef, onClose }) {
           <input type="text" placeholder="what to paint instead (optional)" value={prompt}
             onChange={(e) => setPrompt(e.target.value)} style={{ width: 200 }} />
         )}
+        <label title="never repaint the person, even where the brush covers them (e.g. feet on a floor)">
+          <input type="checkbox" checked={protect} onChange={(e) => setProtect(e.target.checked)} /> protect subject
+        </label>
         {hasSaved && <button onClick={dropMask}>Delete saved mask</button>}
         <span className="spacer" />
         <button onClick={onClose}>Cancel</button>

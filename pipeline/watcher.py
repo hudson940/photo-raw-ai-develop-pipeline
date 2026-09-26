@@ -1,4 +1,4 @@
-"""Inbox watcher: detects new RAW files and enqueues them once fully written.
+"""Inbox watcher: detects new RAW/JPG files and enqueues them once fully written.
 
 Uses watchdog's PollingObserver — inotify does not work reliably on Windows
 mounts (/mnt/c) or Samba shares, which is where the inbox will live.
@@ -12,14 +12,15 @@ from pathlib import Path
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers.polling import PollingObserver
 
-from .config import CONFIG, RAW_EXTENSIONS
+from .config import CONFIG, SOURCE_EXTENSIONS
 from . import db
 
 log = logging.getLogger("watcher")
 
 
-def is_raw(path: Path) -> bool:
-    return path.suffix.lower() in RAW_EXTENSIONS
+def is_source(path: Path) -> bool:
+    """RAW or camera JPG — anything the pipeline can process."""
+    return path.suffix.lower() in SOURCE_EXTENSIONS
 
 
 def owner_for(path: Path) -> str | None:
@@ -69,7 +70,7 @@ class RawFileHandler(FileSystemEventHandler):
         if event.is_directory:
             return
         path = Path(event.src_path)
-        if not is_raw(path):
+        if not is_source(path):
             return
         if not wait_until_stable(path, CONFIG.stable_check_delay_s):
             log.warning("File never stabilized, skipping: %s", path)
@@ -84,7 +85,7 @@ def scan_existing(conn: sqlite3.Connection) -> int:
     subfolders inbox/<user>/ are ingested and attributed to that user)."""
     added = 0
     for path in sorted(CONFIG.inbox.rglob("*")):
-        if path.is_file() and is_raw(path):
+        if path.is_file() and is_source(path):
             if db.enqueue(conn, path, owner_for(path)):
                 log.info("Enqueued existing file %s", path.name)
                 added += 1

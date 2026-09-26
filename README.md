@@ -1,6 +1,6 @@
 # Automated RAW Photo Development Pipeline
 
-Watch folder → SQLite queue → RAW preview extraction → AI vision analysis → RAW develop
+Watch folder → work queue → RAW preview extraction → AI vision analysis → RAW develop
 (16-bit TIFF) → deterministic retouch → publish/archive with a decision log.
 
 ## Deploy with Docker Compose
@@ -17,8 +17,27 @@ docker compose up -d --build            # webui on :8765 + worker watching ./inb
   Set `PIPELINE_WEBUI_PASSWORD` — the container listens on `0.0.0.0`, so without it the
   operator UI is open to the network (it warns on boot). Share links keep their own passwords.
 - **worker** — watches the mounted `./inbox` for new RAWs and runs analyze → develop → retouch.
-- Both share the `data` volume (SQLite queue + local file cache) and the `models` volume
-  (rembg weights). Drop RAW files into `./inbox` on the host.
+- Both share the `data` volume (local file cache + the SQLite DB by default) and the `models`
+  volume (rembg weights). Drop RAW files into `./inbox` on the host.
+
+### Database (SQLite or PostgreSQL)
+
+The work queue, albums, share links and photo metadata live in a database selected by
+`PIPELINE_DATABASE_URL`:
+
+- **SQLite (default).** Leave `PIPELINE_DATABASE_URL` empty (or unset) and the DB is a
+  `pipeline.db` file under `PIPELINE_ROOT` — zero-config, single-node. No extra container.
+- **PostgreSQL (opt-in).** Set `PIPELINE_DATABASE_URL=postgresql://user:pass@host:5432/db`.
+  A bundled Postgres is available behind the `postgres` compose profile (point the URL at
+  `@db:5432`, set `DB_PASSWORD`; `DB_USER`/`DB_NAME` default to `photoraw`):
+
+  ```bash
+  docker compose --profile postgres up -d
+  ```
+
+  or point the URL at any external Postgres and skip the profile.
+
+The schema is created and migrated automatically on first connect for either backend.
 
 ### Object storage (S3-compatible)
 
@@ -40,10 +59,19 @@ docker compose --profile local-s3 up -d       # MinIO on :9000 (console :9001), 
 With `PIPELINE_STORAGE=local` (the default) everything stays on the volume and no S3/boto3 is
 used — the same code path, storage calls become no-ops.
 
-> Design note: the pipeline's own queue/albums stay on SQLite (on a volume) — single-host compose
-> doesn't need Postgres for them. Operator identity is the exception: it's delegated to Keycloak
-> (below), which brings its own Postgres. Customer share links keep their built-in per-link PBKDF2
-> auth. The seams are isolated (`pipeline/storage.py`, `pipeline/auth.py`, `db.connect`).
+**Client-side encryption (E2E).** Set `STORAGE_ENCRYPTION_KEY` (a 32-byte key —
+`openssl rand -base64 32` — or a passphrase) to encrypt every object *before* it is uploaded
+and decrypt it after download (AES-256-GCM, streamed in chunks). The bucket then holds only
+ciphertext, so the storage provider and anyone with the S3 keys can't read the photos; the
+local `data` cache stays plaintext because the pipeline needs real files. Object **keys** are
+not encrypted (filenames stay visible in listings), and switching it on over an existing
+plaintext bucket is safe — old objects are detected and passed through, new ones encrypted.
+**Keep the key safe and unchanged: losing it makes every remote-only photo unrecoverable.**
+
+> Design note: the pipeline's queue/albums/metadata run on SQLite by default (or Postgres when
+> `PIPELINE_DATABASE_URL` is set — see above). Operator identity is delegated to Keycloak (below),
+> which brings its own separate Postgres. Customer share links keep their built-in per-link PBKDF2
+> auth. The seams are isolated (`pipeline/storage.py`, `pipeline/auth.py`, `pipeline/db.py`).
 
 ### Operator authentication & users (Keycloak)
 
@@ -158,7 +186,15 @@ inbox/ ──watcher──▶ pending ──▶ previewed ──▶ analyzed    
 | `PIPELINE_PREVIEW_LONG_EDGE` | `1536` | Preview size sent to the AI |
 | `PIPELINE_MAX_ATTEMPTS` | `3` | Retries before a photo is marked failed |
 | `PIPELINE_HIGHLIGHT_KNEE` | `0.75` | Highlights above this roll off smoothly toward white instead of hard-clipping (protects bright skin from blowing out); `1.0` disables |
-| `PIPELINE_JPEG_QUALITY` | `90` | JPEG quality for published output images |
+| `PIPELINE_AUTO_STUDIO_BG` | `1` | Default background action is `auto` (studio backdrops are expanded/cleaned, real scenes kept); `0` = always `keep` unless `--background` is passed |
+| `PIPELINE_EXPAND_SHADOW` | `0.6` | `expand`: how much of the subject's real cast shadow + contact shadow to keep (0-1) |
+| `PIPELINE_EXPAND_GRAIN` | `1.0` | `expand`: grain matched to the backdrop so it doesn't look plastic (0 disables) |
+| `PIPELINE_EXPAND_GENERATIVE` | `1` | `expand`: refine the extension over walls/softboxes with ComfyUI (falls back to the deterministic fill when unreachable) |
+| `PIPELINE_EXPAND_COMFY_DENOISE` | `0.35` | `expand`: ComfyUI denoise for that refine (higher = more generated texture, more risk of invented folds) |
+| `COMFYUI_ENGINE` | `auto` | generative fill engine: `auto` uses **FLUX.1 Fill [dev]** (GGUF, via the ComfyUI-GGUF + comfyui-inpaint-cropandstitch nodes: the mask + context is cropped from the full-res photo, sampled at ~1 MP and stitched back) when ComfyUI has the models, else the SD1.5 checkpoint; `flux` / `sd15` force one |
+| `COMFYUI_FLUX_UNET` / `COMFYUI_FLUX_T5` | `flux1-fill-dev-Q8_0.gguf` / `t5xxl_fp16.safetensors` | FLUX model files (`models/unet`, `models/text_encoders` with `clip_l.safetensors`, `models/vae/ae.safetensors`). FLUX.1 [dev] weights are under a non-commercial licence — check it for commercial use |
+| `PIPELINE_JPEG_QUALITY` | `97` | JPEG quality for published output images |
+| `PIPELINE_JPEG_SUBSAMPLING` | `4:4:4` | JPEG chroma subsampling (`4:4:4` = full color resolution; `4:2:0` = smaller files) |
 | `PIPELINE_KEEP_TIFFS` | _(off)_ | Keep the 16-bit `work/` TIFFs instead of deleting them |
 | `PIPELINE_CANARY_MAX_TOKENS` | `1024` | Token budget for the startup vision canary (needs to be large for local *reasoning* models) |
 | `PIPELINE_REASONING_EFFORT` | `low` | How hard the analysis model thinks: `off`/`low`/`medium`/`high`, or `default` to send nothing. Caps the thinking budget on the Anthropic API; sent as `reasoning_effort` to local servers. Use `default` for local GGUFs that expose no reasoning control (LM Studio logs "cannot be converted to custom KVs") |
@@ -197,7 +233,9 @@ decision log:
 ```bash
 # every recorded run for one file, newest last
 grep IMG_6914 data/decision_log.jsonl | python -m json.tool   # (or | jq)
+# SQLite backend:
 sqlite3 data/pipeline.db "SELECT id, filename, state, confidence FROM photos"
+# PostgreSQL backend: psql "$PIPELINE_DATABASE_URL" -c "SELECT id, filename, state FROM photos"
 ```
 
 ## Retouch (Stages 5–6)
@@ -237,19 +275,48 @@ the full-resolution 16-bit TIFF (`pipeline/retouch.py`):
   untouched (uses the subject mask); useful for backlit/underexposed subjects
 - **background exposure** — brightens (or darkens) only the background in EV stops, subject left
   untouched; darken a distracting/blown background so the subject stands out
-- **background** — **`keep` by default, always** (the background is never changed automatically);
-  change it only by passing `--background`: `auto` (inspect the scene and pick smooth/studio/keep —
-  see below) / `blur` (bokeh) / `smooth` (de-wrinkle a backdrop: clone out imperfections, then
-  smooth creases) / `studio` (solid backdrop — pick a color with `--studio-color`: gray/white/
-  black/charcoal/blue/navy/teal/green/red/maroon/pink/purple/beige/brown or a `#hex`) / `replace`
-  (generative, needs ComfyUI; falls back to `studio` when down)
-  - **`--background auto`** decides for you from the background region: a neutral studio backdrop
-    that fills the frame but has fold **wrinkles → `smooth`**; a backdrop that only partly fills
-    the frame with **other zones visible (floor, stands, wall) → `studio`** using the backdrop's
-    own tone (`white`/`gray`/`black` from its lightness); **anything else → `keep`**. Add it to
-    `pipeline.run` to auto-handle every photo, or per photo via `redo <id> --background auto`.
+- **background** — **`auto` by default**: studio backdrops are detected and cleaned, real
+  scenes are left untouched (`PIPELINE_AUTO_STUDIO_BG=0` restores the old always-`keep`
+  default). Override per photo with `--background`: `keep` / `auto` (see below) / `blur`
+  (bokeh) / `smooth` (de-wrinkle a backdrop: clone out imperfections, then smooth creases) /
+  `clean` (clean only the backdrop cloth) / `expand` (clean the backdrop and extend it over
+  the **whole frame** — see below) / `studio`
+  (solid backdrop — pick a color with `--studio-color`: gray/white/black/charcoal/blue/navy/
+  teal/green/red/maroon/pink/purple/beige/brown or a `#hex`) / `replace` (generative, needs
+  ComfyUI; falls back to `studio` when down)
+  - **`auto`** decides from the background region: a neutral studio backdrop that fills the
+    frame but has wrinkles/folds/marks, or one that only partly fills the frame with **other
+    zones visible (floor, stands, wall, softboxes, reflector mats) → `expand`**; a clean
+    seamless backdrop, a near-black background (night/event scenes look like a black
+    backdrop, so black is never auto-expanded — use `--background expand` for a black studio
+    backdrop), or **anything else → `keep`**.
+  - **`expand`** (the `auto` choice) cleans the backdrop and extends it over the whole frame:
+    1. The real backdrop is found by its dye color and texture. Crinkled silver mats and
+       reflectors don't count as cloth.
+    2. **Props resting on the backdrop** (balloons, plush, flowers) are detected and kept,
+       like the subject.
+    3. The cloth itself is cleaned in place with a layer of its own color and light gradient.
+       Wrinkles, folds, creases and shoe marks are flattened, and the real shadows of the
+       subject and props are kept softly.
+    4. Everything that isn't cloth (walls, softboxes, straps, floor) is pre-filled with that
+       clean backdrop, plus a soft contact shadow under the subject. It is then refined with
+       **ComfyUI** inpainting at low denoise (`PIPELINE_EXPAND_COMFY_DENOISE`, default 0.35),
+       so the extension reads as the same cloth. If ComfyUI is down, or
+       `PIPELINE_EXPAND_GENERATIVE=0`, the deterministic fill is used.
+    5. The result is composited behind the subject with edge-aware matting, so hair and shoe
+       edges stay clean.
 
-Final images are published to `output/` as **JPEG (quality 90 by default)**, a few MB each.
+    Tune it with `PIPELINE_EXPAND_SHADOW` (0-1, default 0.6) and `PIPELINE_EXPAND_GRAIN`
+    (0-2, default 1).
+  - **`clean`** does only step 3. The cloth is cleaned in place and everything else is left
+    exactly as shot.
+
+**JPG input**: camera JPGs (`.jpg`/`.jpeg`) dropped in the inbox or uploaded in the web UI go
+through the same pipeline as RAWs (preview → quality gate → AI analysis → develop → retouch →
+output). Develop skips the RAW decode and any Kelvin white-balance override, since the camera
+already baked the balance in. EXIF orientation is honored.
+
+Final images are published to `output/` as **JPEG (quality 97, 4:4:4 chroma by default)**, ~2-4 MB each.
 The 16-bit intermediate TIFFs live in `work/` and are deleted once the JPEG is published
 (set `PIPELINE_KEEP_TIFFS=1` to keep them).
 
@@ -289,7 +356,10 @@ python -m pipeline.redo 6 --skin-target 0.7 --subject-target 0.5   # tune the pe
 python -m pipeline.redo 6 --shadows 25 --highlights -30   # lift shadows, recover highlights
 python -m pipeline.redo 6 --wb camera              # accurate as-shot white balance (default)
 python -m pipeline.redo 6 --wb 5200 --tint 5       # override white balance in Kelvin
-python -m pipeline.redo 6 --background auto        # decide smooth/studio/keep from the scene
+python -m pipeline.redo 6 --background auto        # decide expand/keep from the scene (default)
+python -m pipeline.redo 6 --background expand      # clean the backdrop + extend it over walls/softboxes
+python -m pipeline.redo 6 --background clean       # clean only the backdrop cloth, leave the rest
+python -m pipeline.redo 6 --background keep        # leave the background untouched
 python -m pipeline.redo 6 --background blur        # bokeh background
 python -m pipeline.redo 6 --background smooth      # de-wrinkle a studio backdrop
 python -m pipeline.redo 6 --studio-color blue      # solid blue studio backdrop

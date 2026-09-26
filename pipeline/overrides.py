@@ -9,6 +9,8 @@ develop/retouch.
 
 import argparse
 
+from .config import CONFIG
+
 # retouch flag -> (dest, kind); kind "float" | "bool"; float flags also imply a portrait
 _RETOUCH_FLOAT_FLAGS = {
     "skin": "skin_smoothing",
@@ -92,17 +94,29 @@ def add_override_args(parser: argparse.ArgumentParser) -> None:
                    help="brighten (+) or darken (-) only the subject, in EV stops (e.g. 0.5, -0.3)")
     g.add_argument("--background-exposure", type=float, metavar="EV",
                    help="brighten (+) or darken (-) only the background, in EV stops")
+    g.add_argument("--exposure", dest="exposure_ev", type=float, metavar="EV",
+                   help="global exposure in EV stops (+1 = 2x scene light); re-develops the RAW")
     g.add_argument("--shadows", type=float, metavar="-100..100",
                    help="lift (+) or crush (-) shadows globally")
     g.add_argument("--highlights", type=float, metavar="-100..100",
                    help="boost (+) or recover (-) highlights globally")
-    g.add_argument("--background", choices=["auto", "keep", "blur", "smooth", "studio", "replace"],
-                   help="background handling (auto = pick smooth/studio/keep from the scene; "
-                        "smooth = de-wrinkle a backdrop)")
+    g.add_argument("--background", choices=["auto", "keep", "blur", "smooth", "clean", "expand", "studio", "replace"],
+                   help="background handling (auto = detect a studio backdrop and clean it, else keep; "
+                        "clean = clean only the backdrop cloth — wrinkles, folds, shoe marks — "
+                        "keeping props/balloons and everything else as shot; expand = rebuild the "
+                        "backdrop over the whole frame, hiding stands/walls/floor too)")
     g.add_argument("--studio-color", metavar="NAME|#hex",
                    help="studio backdrop color: gray/white/black/charcoal/blue/navy/teal/green/"
                         "red/maroon/pink/purple/beige/brown or a #hex; implies --background studio")
     g.add_argument("--prompt", help="background description for --background replace")
+    g.add_argument("--backdrop-color", dest="backdrop_color", metavar="auto|NAME|#hex",
+                   help="for --background clean/expand: re-tint the cleaned backdrop cloth to this "
+                        "color (e.g. white), keeping its light gradient and shadows; auto = keep "
+                        "the cloth's own color")
+    g.add_argument("--floor", choices=["none", "water", "foil"],
+                   help="turn a crinkled silver floor (reflector panels / foil mats) into a "
+                        "reflective floor: water = glossy rippled mirror, foil = mirror that "
+                        "keeps the aluminum crinkle; none = leave the floor as shot")
     g.add_argument("--erase-mask", dest="erase_mask", metavar="PNG",
                    help="erase the white regions of this mask image from the photo "
                         "(object removal; the web UI draws these masks for you)")
@@ -112,6 +126,9 @@ def add_override_args(parser: argparse.ArgumentParser) -> None:
                         "generative (ComfyUI Generative Fill; needs ComfyUI running)")
     g.add_argument("--erase-prompt", dest="erase_prompt", metavar="TEXT",
                    help="what the generative fill should paint in the erased area")
+    g.add_argument("--protect-subject", dest="protect_subject", action="store_true", default=None,
+                   help="never erase/regenerate the main subject, even where the mask covers it "
+                        "(e.g. feet on a floor being replaced)")
     g.add_argument("--clear-erase", dest="clear_erase", action="store_true",
                    help="remove a previously saved erase mask from this photo")
     g.add_argument("--wb", metavar="camera|KELVIN",
@@ -199,6 +216,8 @@ def overrides_from_args(args: argparse.Namespace) -> dict | None:
         erase["method"] = args.erase_method
     if getattr(args, "erase_prompt", None) is not None:
         erase["prompt"] = args.erase_prompt
+    if getattr(args, "protect_subject", None):
+        erase["protect_subject"] = True
     if erase:
         retouch["erase"] = erase
 
@@ -218,6 +237,10 @@ def overrides_from_args(args: argparse.Namespace) -> dict | None:
         retouch.setdefault("background", {})["action"] = args.background
     if getattr(args, "prompt", None) is not None:
         retouch.setdefault("background", {})["replace_prompt"] = args.prompt
+    if getattr(args, "backdrop_color", None) is not None:
+        retouch.setdefault("background", {})["backdrop_color"] = args.backdrop_color
+    if getattr(args, "floor", None) is not None:
+        retouch.setdefault("background", {})["floor"] = args.floor
     if getattr(args, "studio_color", None) is not None:
         b = retouch.setdefault("background", {})
         b["color"] = args.studio_color
@@ -237,6 +260,8 @@ def overrides_from_args(args: argparse.Namespace) -> dict | None:
 
     # develop-stage tonal controls (global); changing these forces a re-develop
     develop: dict = {}
+    if getattr(args, "exposure_ev", None) is not None:
+        develop["exposure_ev"] = args.exposure_ev
     if getattr(args, "shadows", None) is not None:
         develop["shadows"] = args.shadows
     if getattr(args, "highlights", None) is not None:
@@ -283,10 +308,11 @@ def background_overridden(overrides: dict | None) -> bool:
 
 
 def force_keep_background(analysis: dict) -> None:
-    """Reset the background to 'keep'. Background is only ever changed on explicit request,
-    so unless --background was passed we never touch it (even if the analysis says otherwise)."""
+    """Reset the background to the default when --background wasn't passed (the AI never
+    chooses it): 'auto' — studio backdrop cloth is cleaned, real scenes are kept — or
+    'keep' when PIPELINE_AUTO_STUDIO_BG=0."""
     bg = analysis.setdefault("retouch", {}).setdefault("background", {})
-    bg["action"] = "keep"
+    bg["action"] = "auto" if CONFIG.auto_studio_background else "keep"
     bg.setdefault("replace_prompt", "")
 
 

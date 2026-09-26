@@ -13,7 +13,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
-from .config import CONFIG
+from .config import CONFIG, is_jpeg
 from .storage import STORAGE
 
 log = logging.getLogger("preview")
@@ -91,8 +91,15 @@ def _downscale(src: Path, dest: Path) -> None:
 
 
 def make_preview(raw_path: Path) -> Path:
-    """Produce previews/<stem>.jpg for the given RAW file."""
+    """Produce previews/<stem>.jpg for the given RAW (or camera JPG) file."""
     dest = CONFIG.previews / f"{raw_path.stem}.jpg"
+    if is_jpeg(raw_path):                    # camera JPG: it *is* the rendering
+        try:
+            _downscale(raw_path, dest)
+        except Exception as exc:
+            raise PreviewError(f"Could not read JPG {raw_path}: {exc}") from exc
+        STORAGE.put(dest)
+        return dest
     with tempfile.TemporaryDirectory(dir=CONFIG.previews) as tmp_dir:
         # a path that does NOT exist yet — darktable-cli refuses to overwrite
         # an existing file and silently exports to <name>_01.jpg instead

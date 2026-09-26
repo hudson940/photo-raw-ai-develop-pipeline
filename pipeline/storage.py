@@ -41,8 +41,13 @@ class Storage:
         self._index: dict[str, float] | None = None   # key -> remote mtime (epoch)
         self._index_at = 0.0
         self._index_lock = threading.Lock()
+        self._enc_key: bytes | None = None             # client-side encryption key
         if self.backend == "s3" and not (CONFIG.s3_endpoint or CONFIG.s3_region):
             log.warning("PIPELINE_STORAGE=s3 but no S3_ENDPOINT_URL/S3_REGION configured")
+        if self.backend == "s3" and CONFIG.storage_encryption_key:
+            from . import crypto
+            self._enc_key = crypto.load_key(CONFIG.storage_encryption_key)
+            log.info("Object storage client-side encryption is ON (E2E; bucket holds ciphertext)")
 
     # ----------------------------------------------------------------- plumbing
     @property
@@ -108,12 +113,22 @@ class Storage:
         key = self.key_for(path)
         if key is None or not Path(path).exists():
             return
+        enc_tmp: Path | None = None
         try:
-            self.client().upload_file(str(path), CONFIG.s3_bucket, key)
+            source = Path(path)
+            if self._enc_key is not None:              # encrypt before it leaves the host
+                from . import crypto
+                enc_tmp = source.with_name(source.name + ".enc")
+                crypto.encrypt_file(source, enc_tmp, self._enc_key)
+                source = enc_tmp
+            self.client().upload_file(str(source), CONFIG.s3_bucket, key)
             self._note_uploaded(key, time.time())
             log.debug("Uploaded %s", key)
         except Exception as exc:      # storage must never break a render
             log.error("Upload of %s failed: %s", key, exc)
+        finally:
+            if enc_tmp is not None:
+                enc_tmp.unlink(missing_ok=True)
 
     def get(self, path: Path) -> Path | None:
         """Return a local path for the file, downloading it if the cache is cold.
@@ -131,15 +146,21 @@ class Storage:
             index = self._remote_index(refresh=True)   # might be brand new
             if key not in index:
                 return None
+        tmp = path.with_name(path.name + ".s3tmp")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(path.name + ".s3tmp")
             self.client().download_file(CONFIG.s3_bucket, key, str(tmp))
-            tmp.replace(path)
+            if self._enc_key is not None:              # decrypt into the cache (plaintext passthrough if not ours)
+                from . import crypto
+                crypto.decrypt_file(tmp, path, self._enc_key)
+                tmp.unlink(missing_ok=True)
+            else:
+                tmp.replace(path)
             log.info("Restored %s from object storage", key)
             return path
         except Exception as exc:
             log.error("Download of %s failed: %s", key, exc)
+            tmp.unlink(missing_ok=True)
             return None
 
     def exists(self, path: Path) -> bool:

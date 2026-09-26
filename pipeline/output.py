@@ -17,7 +17,7 @@ import numpy as np
 import tifffile
 from PIL import Image, ImageOps
 
-from .config import CONFIG
+from .config import CONFIG, is_jpeg
 from .storage import STORAGE
 
 log = logging.getLogger("output")
@@ -34,7 +34,8 @@ def _to_jpeg(src: Path, dest: Path, quality: int) -> None:
         img = Image.fromarray(arr)
     else:
         img = ImageOps.exif_transpose(Image.open(src))
-    img.convert("RGB").save(dest, "JPEG", quality=quality, subsampling="4:2:0", optimize=True)
+    img.convert("RGB").save(dest, "JPEG", quality=quality,
+                            subsampling=CONFIG.output_jpeg_subsampling, optimize=True)
 
 
 def cleanup_intermediates(stem: str) -> None:
@@ -111,7 +112,7 @@ def write_rapidraw_sidecar(filename: str, analysis_json: str | None) -> Path | N
 
     Disabled by default (CONFIG.write_rrdata); enable with PIPELINE_WRITE_RRDATA=1.
     """
-    if not CONFIG.write_rrdata:
+    if not CONFIG.write_rrdata or is_jpeg(filename):     # the sidecar maps RAW develop sliders
         return None
     if not analysis_json:
         return None

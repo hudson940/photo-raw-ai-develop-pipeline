@@ -223,3 +223,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+
+# Large gender-classifier model binaries (provided/generated, shipped like YuNet via models/;
+# see AGENTS.md). The small deploy prototxt IS tracked.
+models/gender_net.caffemodel
+models/gender_net.onnx

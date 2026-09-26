@@ -12,7 +12,9 @@ TIFF at full resolution:
 - eye brightening   feathered midtone lift at the detected eye landmarks
 - teeth whitening   yellow-cast reduction inside the detected mouth region
 - clothing contrast CLAHE local contrast on the subject, skin excluded
-- background        keep / blur / studio backdrop / generative replace
+- background        keep / blur / smooth / clean (clean only the backdrop cloth, in
+                    place) / expand (rebuild the backdrop across the whole frame) /
+                    studio backdrop / generative replace
 
 Face detection is OpenCV YuNet (bundled ONNX model, CPU, milliseconds).
 Subject/background separation is rembg (U²-Net). Generative background
@@ -38,7 +40,21 @@ log = logging.getLogger("retouch")
 
 _MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 _YUNET_PATH = _MODELS_DIR / "face_detection_yunet_2023mar.onnx"
+# Gender classifier (Levi-Hassner, converted from Caffe to ONNX so it loads on OpenCV 5,
+# which dropped the Caffe importer). Optional: absent -> gender stays "unknown" and every
+# foreground face is retouched fully (no regression). Output index 0 = Male, 1 = Female.
+_GENDER_ONNX = _MODELS_DIR / "gender_net.onnx"
+_GENDER_MEAN = (78.4263377603, 87.7689143744, 114.895847746)
+# Only treat a foreground face as male (and skip the women-only ops — lips, cheek blush) when
+# the model is at least this confident; otherwise default to full retouch so the main subject
+# (usually a woman) is never under-retouched by a shaky call.
+_GENDER_MALE_MIN = 0.60
+# A detected face counts as foreground when its box overlaps the subject matte by at least this
+# fraction — cleanly separates the first-plane subject from background guests.
+_FOREGROUND_MATTE_MIN = 0.30
 _WORKFLOW_DIR = Path(__file__).resolve().parent / "workflows"
+
+_gender_net = None  # lazy singleton; cv2 DNN net for the gender model
 
 # Overall strength multiplier per requested intensity level
 _INTENSITY = {"subtle": 0.6, "natural": 1.0, "polished": 1.3}
@@ -60,6 +76,7 @@ class Face:
     left_eye: tuple[float, float]
     mouth_right: tuple[float, float]
     mouth_left: tuple[float, float]
+    gender: str = "unknown"   # "female" | "male" | "unknown"; set after foreground filtering
 
 
 # --------------------------------------------------------------------------- I/O
@@ -94,6 +111,7 @@ def dump_skin_mask(tiff_path: Path, out_path: Path, long_edge: int = 1500) -> tu
     img = _load_image(Path(tiff_path))
     faces = _detect_faces(img)
     alpha = _subject_alpha(img) if faces else None
+    faces = _foreground_faces(faces, alpha, img.shape) if faces else faces   # match retouch scope
     skin = _skin_mask(img, faces, alpha) if faces else np.zeros(img.shape[:2], np.float32)
 
     over = img.copy()
@@ -146,6 +164,73 @@ def _detect_faces(img: np.ndarray) -> list[Face]:
             ))
         return faces
     return []
+
+
+def _foreground_faces(faces: list[Face], subject: np.ndarray | None,
+                      shape: tuple) -> list[Face]:
+    """Keep only faces on the first-plane subject; drop background/second-plane people.
+
+    The subject matte (rembg) is the reliable signal — a face whose box sits on the matte is
+    part of the photographed subject, guests behind them are not. Falls back to relative face
+    size when no matte is available (rembg off/failed), and never returns empty when faces exist
+    (keeps the largest) so a portrait is never left entirely un-retouched.
+    """
+    if not faces:
+        return faces
+    h, w = shape[:2]
+    if subject is not None:
+        kept = []
+        for f in faces:
+            x1, y1 = max(0, int(f.x)), max(0, int(f.y))
+            x2, y2 = min(w, int(f.x + f.w)), min(h, int(f.y + f.h))
+            a = subject[y1:y2, x1:x2]
+            if a.size and float((a > 0.5).mean()) >= _FOREGROUND_MATTE_MIN:
+                kept.append(f)
+        if kept:
+            return kept
+        # matte present but no face landed on it — fall back to the biggest face only
+        return [max(faces, key=lambda f: f.w)]
+    # no matte: keep faces at least half as wide as the largest (drops small background heads)
+    mx = max(f.w for f in faces)
+    return [f for f in faces if f.w >= 0.5 * mx]
+
+
+def _gender_model():
+    """Lazy-load the ONNX gender classifier; returns None when the model file is absent."""
+    global _gender_net
+    if _gender_net is None:
+        if not _GENDER_ONNX.exists():
+            log.info("Gender model missing at %s — gender-specific gating disabled", _GENDER_ONNX)
+            return None
+        _gender_net = cv2.dnn.readNetFromONNX(str(_GENDER_ONNX))
+    return _gender_net
+
+
+def _classify_gender(bgr_u8: np.ndarray, face: Face, shape: tuple) -> str:
+    """Classify one face as 'female' / 'male' / 'unknown' from a padded bbox crop.
+
+    Biased toward 'female': a face is only called male when the model is confidently so
+    (>= _GENDER_MALE_MIN), so the main subject is never wrongly stripped of women-only ops.
+    """
+    net = _gender_model()
+    if net is None:
+        return "unknown"
+    h, w = shape[:2]
+    cx, cy = face.x + face.w / 2, face.y + face.h / 2
+    hw, hh = face.w * 0.9, face.h * 0.9        # ~0.4 padding around the face box
+    x1, y1 = max(0, int(cx - hw)), max(0, int(cy - hh))
+    x2, y2 = min(w, int(cx + hw)), min(h, int(cy + hh))
+    crop = bgr_u8[y1:y2, x1:x2]
+    if crop.size == 0:
+        return "unknown"
+    blob = cv2.dnn.blobFromImage(crop, 1.0, (227, 227), _GENDER_MEAN, swapRB=False)
+    net.setInput(blob)
+    male, female = (float(v) for v in net.forward()[0][:2])
+    if male >= _GENDER_MALE_MIN and male > female:
+        return "male"
+    if female > male:
+        return "female"
+    return "unknown"
 
 
 # ------------------------------------------------------------------------- masks
@@ -570,7 +655,8 @@ def _classify_skin_type(l_med: float, b_med: float) -> str:
 
 def _skin_tone_correction(img: np.ndarray, skin: np.ndarray, strength: float,
                           skin_type: str = "auto", warmth: float = 0.0,
-                          saturation: float = 1.0, red: float = 0.0) -> np.ndarray:
+                          saturation: float = 1.0, red: float = 0.0,
+                          red_mask: np.ndarray | None = None) -> np.ndarray:
     """Even out blotchy skin and rotate it toward a warm, orange-leaning tone for its skin type.
 
     Works on the skin's hue: the whole chroma cloud is rotated toward the type's target hue
@@ -625,13 +711,16 @@ def _skin_tone_correction(img: np.ndarray, skin: np.ndarray, strength: float,
 
     a_rot = (a * cos - b * sin) * cs                # rotate toward orange, then scale chroma
     b_rot = (a * sin + b * cos) * cs
-    if red > 0.001:
-        # add a healthy red flush (raise a* in the midtones, where cheeks live) so skin has the
-        # warm red the camera's colour science shows, without reddening shadows or hot highlights
-        wL = np.exp(-((L - 50.0) / 35.0) ** 2)
-        a_rot = a_rot + red * 7.0 * wL
     lab[..., 1] = a * (1 - skin) + a_rot * skin
     lab[..., 2] = b * (1 - skin) + b_rot * skin
+    if red > 0.001:
+        # add a healthy red flush (raise a* in the midtones, where cheeks live) so skin has the
+        # warm red the camera's colour science shows, without reddening shadows or hot highlights.
+        # `red_mask` scopes the flush (e.g. to female faces only); defaults to the full skin mask,
+        # which reproduces the original whole-skin behaviour exactly.
+        wL = np.exp(-((L - 50.0) / 35.0) ** 2)
+        rmask = skin if red_mask is None else red_mask
+        lab[..., 1] = lab[..., 1] + red * 7.0 * wL * rmask
     hue_out = float(np.degrees(np.arctan2(np.median(b_rot[sel]), np.median(a_rot[sel]))))
     log.info("skin tone: type=%s hue %.0f°->%.0f° (per-pixel, chroma x%.2f, warmth %+.1f)",
              st, h0, hue_out, cs, warmth)
@@ -1047,6 +1136,588 @@ def _smooth_background(img: np.ndarray, alpha: np.ndarray, strength: float = 1.0
     return np.clip(img * a + smoothed * (1 - a), 0, 1)
 
 
+def _fill_small_holes(mask: np.ndarray, max_frac: float) -> np.ndarray:
+    """Fill only enclosed holes smaller than max_frac of the image (objects sitting on a
+    surface), leaving large enclosed areas (a wall boxed in by cloth and the subject) open."""
+    holes = _fill_holes(mask) & ~mask
+    n, lbl, stats, _ = cv2.connectedComponentsWithStats(holes.astype(np.uint8), connectivity=4)
+    small = np.zeros(n, bool)
+    small[1:] = stats[1:, cv2.CC_STAT_AREA] < max_frac * mask.size
+    return mask | small[lbl]
+
+
+def _fill_holes(mask: np.ndarray) -> np.ndarray:
+    """Fill enclosed holes of a boolean mask (flood the outside from a 1px border)."""
+    h, w = mask.shape
+    pad = np.zeros((h + 2, w + 2), np.uint8)
+    pad[1:-1, 1:-1] = mask.astype(np.uint8)
+    cv2.floodFill(pad, np.zeros((h + 4, w + 4), np.uint8), (0, 0), 2)
+    return (pad[1:-1, 1:-1] != 2)
+
+
+def _disk(r: int) -> np.ndarray:
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+
+
+@dataclass
+class _Backdrop:
+    """The studio backdrop as seen behind the subject, measured on a downscale."""
+    region: np.ndarray    # bool (sh, sw): backdrop cloth/paper pixels connected to the subject
+    small: np.ndarray     # float RGB (sh, sw, 3) downscale of the image
+    alpha: np.ndarray     # float (sh, sw) downscaled subject matte
+    subject: np.ndarray   # bool (sh, sw) matte slightly dilated (never sampled)
+    ring_frac: float = 0.0  # share of the band around the subject's upper half that is backdrop
+    clipped_frac: float = 0.0  # share of the backdrop that is blown to white (sky, window)
+
+
+def _find_backdrop(img: np.ndarray, alpha: np.ndarray, long_edge: int = 800,
+                   k: float = 3.0) -> _Backdrop | None:
+    """Locate the backdrop the subject stands in front of.
+
+    Lightness can't separate it (a gray sweep, the gray wall beside it and the floor tiles
+    all sit at similar L), but a backdrop has ONE dye color: seed its chroma (a*, b*) from the
+    background ring around the subject's upper half, keep low-texture pixels within k robust
+    sigmas of it, and keep only the components touching that ring. Stands, straps, softboxes,
+    walls and reflector mats drop out; lighting gradients and shadows on the cloth don't
+    matter because L is free.
+    """
+    h, w = img.shape[:2]
+    sc = min(1.0, long_edge / max(h, w))
+    sw, sh = max(1, int(w * sc)), max(1, int(h * sc))
+    small = cv2.resize(np.clip(img, 0, 1).astype(np.float32), (sw, sh), interpolation=cv2.INTER_AREA)
+    a_s = cv2.resize(alpha.astype(np.float32), (sw, sh), interpolation=cv2.INTER_AREA)
+    lab = cv2.cvtColor(cv2.GaussianBlur(small, (0, 0), 2), cv2.COLOR_RGB2Lab)
+    long_s = max(sw, sh)
+
+    subject = cv2.dilate((a_s > 0.2).astype(np.uint8), _disk(max(3, int(long_s * 0.006)))) > 0
+    ys = np.nonzero(a_s > 0.5)[0]
+    if ys.size == 0:
+        return None
+    ring = (cv2.dilate(subject.astype(np.uint8), _disk(max(5, int(long_s * 0.025)))) > 0) & ~subject
+    ring[(int(ys.min()) + int(ys.max())) // 2:] = False     # upper half: behind head/shoulders
+    if int(ring.sum()) < 50:
+        return None
+
+    ab = lab[..., 1:]
+    seed = ab[ring]
+    mu = np.median(seed, axis=0)
+    d = np.hypot(ab[..., 0] - mu[0], ab[..., 1] - mu[1])
+    sd = float(np.median(np.hypot(seed[:, 0] - mu[0], seed[:, 1] - mu[1]))) * 1.4826 + 0.3
+    L = lab[..., 0]
+    m = cv2.blur(L, (9, 9))
+    tex = np.sqrt(np.maximum(cv2.blur(L * L, (9, 9)) - m * m, 0))
+    # fine-grain texture on the unblurred downscale: crinkled silver mats / reflectors
+    # measure ~3-5, cloth (even heavily wrinkled) stays under ~1.5
+    l_raw = cv2.cvtColor(small, cv2.COLOR_RGB2Lab)[..., 0]
+    hp = l_raw - cv2.GaussianBlur(l_raw, (0, 0), 1.5)
+    fine = np.sqrt(cv2.GaussianBlur(hp * hp, (0, 0), 4))
+    cand = ((d < k * sd) & ~subject & (tex < 6.0) & (fine < 2.0)).astype(np.uint8)
+    cand = cv2.morphologyEx(cand, cv2.MORPH_OPEN, _disk(max(2, int(long_s * 0.005))))  # cut thin bridges
+    _, lbl = cv2.connectedComponents(cand, connectivity=4)
+    keep = np.unique(lbl[ring & (cand > 0)])
+    region = np.isin(lbl, keep[keep > 0])
+
+    # second pass: the same cloth can be far more wrinkled where it lies on the floor (a
+    # sheet under the subject) and fails the strict texture test. Grow the region into
+    # connected pixels of the same dye whose lightness — with the wrinkles blurred out —
+    # matches the nearby backdrop (a floor sheet under the key light may be up to ~25 L
+    # brighter), allowing more fine texture (a crinkled silver reflector is busier, ~4.7).
+    if region.any():
+        w_r = region.astype(np.float32)
+        sg = long_s * 0.08
+        den = cv2.GaussianBlur(w_r, (0, 0), sg)
+        ref_l = cv2.GaussianBlur(L * w_r, (0, 0), sg) / np.maximum(den, 1e-3)
+        ref_l = np.where(den > 0.05, ref_l, float(np.median(L[region])))   # far from any backdrop
+        l_soft = cv2.GaussianBlur(L, (0, 0), max(2.0, long_s * 0.008))
+        # dye tolerance floored at 3.6: a floor sheet's white drifts ~2.5 from the wall
+        # cloth's (different light), while painted walls / tiles measured ≥4
+        grow = ((d < max(k * sd, 3.6)) & ~subject & (fine < 4.2)
+                & (l_soft - ref_l > -10.0) & (l_soft - ref_l < 28.0)).astype(np.uint8)
+        grow = cv2.morphologyEx(grow, cv2.MORPH_CLOSE, _disk(max(2, int(long_s * 0.004))))
+        grow = cv2.morphologyEx(grow, cv2.MORPH_OPEN, _disk(max(2, int(long_s * 0.004)))) & ~subject.astype(np.uint8)
+        # join across small gaps (the crease where the wall cloth meets the floor sheet)
+        near = cv2.dilate(region.astype(np.uint8), _disk(max(3, int(long_s * 0.06)))) > 0
+        _, glbl = cv2.connectedComponents(grow | region.astype(np.uint8), connectivity=4)
+        gkeep = np.unique(glbl[near & ((grow > 0) | region)])
+        region = np.isin(glbl, gkeep[gkeep > 0]) & ((grow > 0) | region)
+    ring_frac = float((region & ring).sum()) / max(1, int(ring.sum()))
+    clipped_frac = float((small[region].min(axis=1) > 0.97).mean()) if region.any() else 0.0
+    return _Backdrop(region, small, a_s, subject, ring_frac, clipped_frac)
+
+
+def _cloth_contact(comp: np.ndarray, bd: _Backdrop) -> float:
+    """Share of the band around a (downscaled) blob that is backdrop cloth — ~1 for an
+    object resting on / in front of the backdrop (a balloon), ~0 for studio clutter beside
+    it (straps on the wall, a softbox, floor tiles). The band starts a little away from the
+    blob because the backdrop mask stops short of any object's edge."""
+    sh, sw = comp.shape
+    long_s = max(sh, sw)
+    cu = comp.astype(np.uint8)
+    band = ((cv2.dilate(cu, _disk(max(3, int(long_s * 0.02)))) > 0)
+            & ~(cv2.dilate(cu, _disk(max(1, int(long_s * 0.006)))) > 0) & ~bd.subject)
+    band[[0, -1], :] = False                   # the frame edge is neither cloth nor clutter
+    band[:, [0, -1]] = False
+    return float((band & bd.region).sum()) / max(1, int(band.sum()))
+
+
+def _backdrop_props(bd: _Backdrop) -> np.ndarray:
+    """Objects placed on the backdrop that are NOT the subject and must be kept — balloons,
+    a plush, flowers, a chair — even when the matting model left them out.
+
+    A prop is a blob that differs clearly from the local backdrop tone (strong color, or much
+    darker/brighter — soft shadows, creases and shoe marks don't qualify) and rests on the
+    cloth (_cloth_contact), unlike stands/straps/walls beside it. A strongly colored object
+    half-resting on the floor at the frame edge still counts. Returns a (sh, sw) bool mask."""
+    region, small = bd.region, bd.small
+    sh, sw = region.shape
+    long_s = max(sh, sw)
+    lab = cv2.cvtColor(cv2.GaussianBlur(small, (0, 0), 1.5), cv2.COLOR_RGB2Lab)
+    w = region.astype(np.float32)
+    sg = long_s * 0.10
+    ref = (cv2.GaussianBlur(lab * w[..., None], (0, 0), sg)
+           / np.maximum(cv2.GaussianBlur(w, (0, 0), sg), 1e-4)[..., None])   # local backdrop tone
+    d_l = np.abs(lab[..., 0] - ref[..., 0])
+    d_c = np.hypot(lab[..., 1] - ref[..., 1], lab[..., 2] - ref[..., 2])
+    cand = (((d_c > 16) | (d_l > 38)) & ~region & ~bd.subject).astype(np.uint8)
+    cand = cv2.morphologyEx(cand, cv2.MORPH_OPEN, _disk(2))
+    n, lbl, stats, cents = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    # the backdrop's column span: columns where the hanging cloth covers most of the upper
+    # half. Clutter (straps, softboxes, walls) lives beside it; props sit in front of it —
+    # even when the floor sheet under them wasn't recognised as cloth.
+    upper = region[: sh // 2]
+    span = upper.mean(axis=0) > 0.5
+    props = np.zeros((sh, sw), bool)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < 0.0015 * sh * sw:
+            continue
+        comp = lbl == i
+        chroma = float(d_c[comp].mean())
+        if not (chroma > 14 or float(d_l[comp].mean()) > 35):
+            continue
+        # tall things hanging from the top of the frame are studio clutter (straps, black
+        # curtains, stands) — balloons and props never reach up to it
+        if stats[i, cv2.CC_STAT_TOP] == 0 and stats[i, cv2.CC_STAT_HEIGHT] > 0.25 * sh:
+            continue
+        contact = _cloth_contact(comp, bd)
+        in_span = bool(span[min(sw - 1, max(0, int(cents[i][0])))]) and cents[i][1] > sh * 0.35
+        # strongly colored only for the span rule: balloons measure 33-40, a wood shelf ~23
+        if contact >= 0.5 or (contact >= 0.2 and chroma > 25) or (in_span and chroma > 28):
+            props |= comp
+    if props.any():
+        props = _fill_holes(cv2.morphologyEx(props.astype(np.uint8), cv2.MORPH_CLOSE, _disk(3)) > 0)
+    return props
+
+
+def _attached_objects(bd: _Backdrop, surf: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """Downscaled bool mask of blobs touching the subject/prop matte, resting on the cloth,
+    whose tone differs strongly from the clean backdrop (|dL| > 18): object parts the matte
+    missed, or the real contact shadow right under them."""
+    sh, sw = bd.region.shape
+    lab = cv2.cvtColor(bd.small, cv2.COLOR_RGB2Lab)
+    d_l = lab[..., 0] - surf[..., 0]
+    matte = cv2.resize(alpha.astype(np.float32), (sw, sh), interpolation=cv2.INTER_AREA) > 0.5
+    touch = cv2.dilate(matte.astype(np.uint8), _disk(max(3, int(max(sh, sw) * 0.01)))) > 0
+    cand = ((np.abs(d_l) > 18) & ~matte & ~bd.region).astype(np.uint8)
+    n, lbl, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    out = np.zeros((sh, sw), bool)
+    for i in range(1, n):
+        area = stats[i, cv2.CC_STAT_AREA]
+        # small only: a balloon's silver body or its contact shadow — not a whole wall /
+        # shelf / tile floor that happens to touch a balloon at the frame edge
+        if area < 0.0003 * sh * sw or area > 0.015 * sh * sw:
+            continue
+        comp = lbl == i
+        if (comp & touch).any() and _cloth_contact(comp, bd) >= 0.3:
+            out |= comp
+    return out
+
+
+def _main_subject(alpha: np.ndarray, faces: list | None, bd: _Backdrop | None = None) -> np.ndarray:
+    """Drop matte blobs that aren't the person (a light stand the matting model grabbed):
+    keep the largest component, any that contain a face, and — given the backdrop — any
+    resting on the cloth (a balloon or prop beside the subject is kept, not painted over)."""
+    _, lbl, stats, _ = cv2.connectedComponentsWithStats((alpha > 0.5).astype(np.uint8), connectivity=8)
+    if stats.shape[0] <= 2:
+        return alpha
+    keep = {1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))}
+    for f in faces or []:
+        cx = min(alpha.shape[1] - 1, max(0, int(f.x + f.w / 2)))
+        cy = min(alpha.shape[0] - 1, max(0, int(f.y + f.h / 2)))
+        if lbl[cy, cx] > 0:
+            keep.add(int(lbl[cy, cx]))
+    if bd is not None:
+        sh, sw = bd.region.shape
+        small_lbl = cv2.resize(lbl.astype(np.int32).astype(np.float32), (sw, sh),
+                               interpolation=cv2.INTER_NEAREST).astype(np.int32)
+        for i in range(1, stats.shape[0]):
+            comp = small_lbl == i
+            if i not in keep and comp.any() and _cloth_contact(comp, bd) >= 0.5:
+                keep.add(i)
+    dropped = stats.shape[0] - 1 - len(keep)
+    if dropped:
+        log.info("expand: dropped %d non-subject matte blob(s)", dropped)
+    keepmask = np.isin(lbl, list(keep)).astype(np.uint8)
+    # soft support so the kept blob's feathered edge survives
+    support = cv2.GaussianBlur(cv2.dilate(keepmask, _disk(max(2, int(max(alpha.shape) * 0.004)))
+                                          ).astype(np.float32), (0, 0), 2)
+    return alpha * np.clip(support, 0, 1)
+
+
+def _smoothstep(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _backdrop_surface(bd: _Backdrop) -> tuple[np.ndarray, np.ndarray] | None:
+    """The backdrop as it would look perfectly clean: its own color and light falloff with
+    no texture, as a (sh, sw, 3) float Lab surface over the whole frame, plus the clean
+    sample mask it was built from. None when too little backdrop is visible."""
+    region, small = bd.region, bd.small
+    sh, sw = region.shape
+    long_s = max(sw, sh)
+    lab = cv2.cvtColor(small, cv2.COLOR_RGB2Lab)
+
+    # 1. clean samples: away from the backdrop border, no local outliers
+    #    (shoe marks, seams, lint)
+    samp = cv2.erode(region.astype(np.uint8), _disk(max(2, int(long_s * 0.006)))) > 0
+    med = cv2.cvtColor(cv2.medianBlur((small * 255).astype(np.uint8), 9), cv2.COLOR_RGB2Lab)
+    samp &= np.abs(med[..., 0].astype(np.float32) * (100.0 / 255.0) - lab[..., 0]) < 4.0
+    if int(samp.sum()) < 200:
+        log.info("backdrop: too little clean backdrop to sample (%d px)", int(samp.sum()))
+        return None
+
+    # 2. multi-scale normalized convolution: bounded by the sampled values (no polynomial
+    #    overshoot), extrapolates smoothly, and the smallest scale (8%) is already larger
+    #    than folds/creases. Finer scales win where they have enough samples nearby.
+    wsamp = samp.astype(np.float32)
+    surf = np.zeros_like(lab)
+    acc = np.zeros((sh, sw), np.float32)
+    for frac in (0.08, 0.16, 0.35):
+        sg = long_s * frac
+        den = cv2.GaussianBlur(wsamp, (0, 0), sg)
+        est = cv2.GaussianBlur(lab * wsamp[..., None], (0, 0), sg) / np.maximum(den, 1e-6)[..., None]
+        conf = np.clip(den / 0.35, 0, 1) * (1 - acc)
+        surf += est * conf[..., None]
+        acc += conf
+    surf /= np.maximum(acc, 1e-6)[..., None]
+    return surf, samp
+
+
+def _backdrop_grain(img: np.ndarray, samp: np.ndarray, seed: int = 0) -> np.ndarray | None:
+    """Grain matched to the backdrop's fine texture (capped: JPG sources carry block noise),
+    so a cleaned flat area doesn't look plastic or band. (h, w) float, or None."""
+    if CONFIG.expand_grain <= 0:
+        return None
+    h, w = img.shape[:2]
+    g = cv2.cvtColor(np.clip(img, 0, 1).astype(np.float32), cv2.COLOR_RGB2GRAY)
+    samp_full = cv2.resize(samp.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
+    hf = (g - cv2.GaussianBlur(g, (0, 0), 1.5))[samp_full]
+    sigma = min(float(hf.std()) if hf.size > 100 else 0.0, 0.006) * CONFIG.expand_grain
+    if sigma <= 0:
+        return None
+    noise = cv2.GaussianBlur(np.random.default_rng(seed).standard_normal((h, w)).astype(np.float32),
+                             (0, 0), 0.6)
+    return noise * (sigma / max(float(noise.std()), 1e-6))
+
+
+def _clean_backdrop(img: np.ndarray, alpha: np.ndarray, bd: _Backdrop | None = None,
+                    seed: int = 0, with_cloth: bool = False, recolor: str | None = None):
+    """Clean ONLY the backdrop cloth, in place — everything that isn't cloth (the subject,
+    balloons and other props, the wall, stands, floor) is left exactly as shot.
+
+    A soft full-res mask selects pixels matching the backdrop's color; over it a layer of the
+    backdrop's own main color + light gradient (_backdrop_surface) is applied. Wrinkles, folds,
+    creases and shoe marks are small tone deviations, so they're flattened; large ones (the
+    real shadows of the subject and props on the cloth) are re-applied softly, without the
+    cloth texture, so shadows stay natural. Only neutral, cloth-colored pixels are touched.
+    Returns None when no backdrop is found; with_cloth=True returns (image, the cloth extent,
+    the layer's opacity — both full-res 0-1 — and the clean layer itself) for callers that
+    extend the backdrop beyond the cloth. recolor (a studio color name or #hex) re-tints the
+    layer to that color, keeping the cloth's light gradient (compressed) and its shadows."""
+    h, w = img.shape[:2]
+    bd = bd or _find_backdrop(img, alpha)
+    if bd is None:
+        return None
+    got = _backdrop_surface(bd)
+    if got is None:
+        return None
+    surf, samp = got
+    sh, sw = bd.region.shape
+    long_s = max(sh, sw)
+
+    # where the cloth is: the backdrop region with its holes (marks, creases) closed, eased
+    # outward a little so its ragged 800px edge doesn't leave an uncleaned rim
+    cloth = _fill_holes(cv2.morphologyEx(bd.region.astype(np.uint8), cv2.MORPH_CLOSE,
+                                         _disk(max(3, int(long_s * 0.01)))) > 0)
+    cloth = cv2.dilate(cloth.astype(np.uint8), _disk(max(2, int(long_s * 0.006)))) > 0
+    cloth_full = cv2.GaussianBlur(cv2.resize(cloth.astype(np.float32), (w, h),
+                                             interpolation=cv2.INTER_LINEAR),
+                                  (0, 0), max(1.5, max(h, w) * 0.002))
+
+    surf_full = cv2.resize(surf.astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC)
+    lab = cv2.cvtColor(np.clip(img, 0, 1).astype(np.float32), cv2.COLOR_RGB2Lab)
+    d_l = lab[..., 0] - surf_full[..., 0]
+    d_c = np.hypot(lab[..., 1] - surf_full[..., 1], lab[..., 2] - surf_full[..., 2])
+
+    # cloth-colored = neutral like the backdrop (a shadow on white cloth is still neutral);
+    # objects on the cloth (balloons, props, skin) are not, so the layer never touches them
+    color_ok = 1.0 - _smoothstep((d_c - 6.0) / 8.0)
+    on_cloth = cloth_full * color_ok * (1.0 - alpha)
+
+    # keep the cloth's real shading, minus its texture: the tone deviation from the clean
+    # surface, low-passed (normalized over cloth pixels so the subject never bleeds in).
+    # Small deviations — wrinkles, creases, shoe marks — are flattened to zero; large ones —
+    # the cast shadows of the subject and props, a deep sweep curve — keep a soft shape.
+    sg = max(2.0, max(h, w) * 0.006)
+    wgt = on_cloth.astype(np.float32)
+    dev = (cv2.GaussianBlur(d_l * wgt, (0, 0), sg)
+           / np.maximum(cv2.GaussianBlur(wgt, (0, 0), sg), 1e-3))
+    keep = dev * _smoothstep((np.abs(dev) - 8.0) / 14.0)
+    # a real cast shadow lies next to what casts it (the subject, a balloon); deep darkening
+    # far from any object is a fold/crease in the cloth and is flattened too
+    objects = ((alpha > 0.5) | ((cloth_full > 0.5) & (color_ok < 0.3))).astype(np.uint8)
+    small_obj = cv2.resize(objects, (sw, sh), interpolation=cv2.INTER_AREA)
+    dist = cv2.distanceTransform((small_obj == 0).astype(np.uint8), cv2.DIST_L2, 5)
+    near = np.clip(1.0 - dist / (long_s * 0.06), 0, 1) ** 1.5
+    keep = keep * cv2.resize(near, (w, h), interpolation=cv2.INTER_LINEAR)
+    keep = np.minimum(keep, 0.0) * CONFIG.expand_shadow_strength / 0.6   # shadows, not hot spots
+    target = surf_full.copy()
+    if recolor:
+        t_rgb = np.array([[_resolve_studio_color(recolor)]], np.float32)
+        t_l, t_a, t_b = cv2.cvtColor(t_rgb, cv2.COLOR_RGB2Lab)[0, 0]
+        med = float(np.median(surf[..., 0]))
+        # new main color; the old light falloff rides on it (softened so a bright color
+        # doesn't clip), and the cast shadows (keep) stay as measured
+        target[..., 0] = np.clip(t_l + (surf_full[..., 0] - med) * 0.6, 0, 99)
+        target[..., 1] = t_a
+        target[..., 2] = t_b
+        log.info("backdrop clean: re-tinting the cloth to %s (L %.0f -> %.0f)", recolor, med, t_l)
+    target[..., 0] += keep
+    target_rgb = cv2.cvtColor(target, cv2.COLOR_Lab2RGB)
+    grain = _backdrop_grain(img, samp, seed)
+    if grain is not None:
+        target_rgb = target_rgb + grain[..., None]
+
+    # a big tone difference on a BUSY neutral surface isn't a shadow on the cloth — it's a
+    # crinkled silver reflector, a mat, a curtain beside it: leave those as shot
+    L = lab[..., 0]
+    hp = L - cv2.GaussianBlur(L, (0, 0), 2.0)
+    busy = np.sqrt(cv2.GaussianBlur(hp * hp, (0, 0), max(2.0, max(h, w) * 0.004)))
+    big = _smoothstep((-dev - 10.0) / 10.0)          # darker only: a bright seam/edge is cleaned
+    smooth_ok = 1.0 - _smoothstep((busy - 2.5) / 3.0)
+    on_cloth = on_cloth * (1.0 - big * (1.0 - smooth_ok))
+    m = _apply_layer_edit("backdrop", cv2.GaussianBlur(on_cloth.astype(np.float32), (0, 0), 1.2))
+    m = m[..., None]
+    log.info("backdrop clean: %.0f%% of the frame is cloth, L=%.0f",
+             100 * float(m.mean()), float(np.median(surf[..., 0])))
+    base = img
+    if recolor:
+        # the cloth pixels the layer leaves as shot (shadows on crumpled cloth, busy patches,
+        # soft matte edges) would stay the old color — tint them too, keeping their own tone
+        # deviation from the clean surface so shading and texture survive
+        tl = np.clip(target[..., 0] - keep + (lab[..., 0] - surf_full[..., 0]), 0, 100)
+        ta = t_a + (lab[..., 1] - surf_full[..., 1]) * 0.5
+        tb = t_b + (lab[..., 2] - surf_full[..., 2]) * 0.5
+        tinted = cv2.cvtColor(np.stack([tl, ta, tb], -1).astype(np.float32), cv2.COLOR_Lab2RGB)
+        # ...and the smooth neutral areas right next to the cloth that the detector left out
+        # as too dark (deep cast shadows, a darker fold or corner of the same sweep). Busy
+        # neutral surfaces (foil reflectors, mats) stay as shot.
+        near_cloth = cv2.resize(cv2.dilate(cloth.astype(np.uint8), _disk(max(3, int(long_s * 0.08)))),
+                                (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+        neutral = 1.0 - _smoothstep((d_c - 8.0) / 6.0)
+        ext = near_cloth * neutral * smooth_ok
+        wt = cv2.GaussianBlur((np.maximum(cloth_full * color_ok, ext) * (1.0 - alpha)).astype(np.float32),
+                              (0, 0), 1.2)[..., None]
+        ed = _layer_edit("backdrop", wt.shape[:2])
+        if ed is not None:
+            wt = np.maximum(wt[..., 0] * (1.0 - ed[1]), ed[0])[..., None]
+        base = img * (1 - wt) + tinted * wt
+    out = np.clip(base * (1 - m) + target_rgb * m, 0, 1)
+    if with_cloth:
+        return out, cloth_full, m[..., 0], np.clip(target_rgb, 0, 1)
+    return out
+
+
+def _refine_fill_comfy(bg: np.ndarray, fill: np.ndarray, samp: np.ndarray,
+                       seed: int = 0) -> np.ndarray:
+    """Refine the pre-filled backdrop extension with ComfyUI inpainting (SD1.5) at moderate
+    denoise: the fill already has the right color/light, the model only makes it read as the
+    same photographed cloth and melts the seam. Only `fill` (0-1) changes; on any ComfyUI
+    failure the deterministic fill is kept."""
+    try:
+        gen = _comfy_inpaint(np.clip(bg, 0, 1), fill,
+                             "empty seamless photography studio backdrop, plain smooth fabric, "
+                             "evenly lit, no objects, no people",
+                             denoise=CONFIG.expand_comfy_denoise)
+    except Exception as exc:      # RetouchError, network, decode — never fail the photo
+        log.warning("expand: ComfyUI refine unavailable (%s) — keeping the deterministic fill", exc)
+        return bg
+    # the model works at ~1024px: re-add full-res grain so it matches the cleaned cloth,
+    # and keep the fill's overall tone (SD drifts brightness/tint slightly)
+    f = cv2.GaussianBlur(fill.astype(np.float32), (0, 0), 3)[..., None]
+    sg = max(bg.shape[:2]) * 0.03
+    drift = cv2.GaussianBlur(gen, (0, 0), sg) - cv2.GaussianBlur(bg, (0, 0), sg)
+    gen = gen - drift
+    grain = _backdrop_grain(bg, samp, seed + 1)
+    if grain is not None:
+        gen = gen + grain[..., None]
+    log.info("expand: extension refined with ComfyUI (denoise %.2f, %.0f%% of frame)",
+             CONFIG.expand_comfy_denoise, 100 * float(fill.mean()))
+    return np.clip(bg * (1 - f) + gen * f, 0, 1)
+
+
+def _expand_backdrop(img: np.ndarray, alpha: np.ndarray, faces: list | None = None,
+                     backdrop: _Backdrop | None = None, seed: int = 0,
+                     recolor: str | None = None) -> np.ndarray | None:
+    """Clean the studio backdrop and extend it over the WHOLE frame behind the subject.
+
+    For studio shots where the backdrop is wrinkled, folded, creased or scuffed with shoe
+    marks and/or doesn't fill the frame (walls, stands, straps, softboxes, floor visible):
+
+      1. find the real backdrop (_find_backdrop) and keep the subject plus any props resting
+         on it (balloons...) — those are never painted over
+      2. clean the cloth itself in place (_clean_backdrop): its own color + light gradient,
+         wrinkles/marks flattened, real cast shadows kept softly
+      3. everything else that isn't cloth (walls, softbox, straps, floor) is pre-filled with
+         the backdrop's clean lighting surface (plus a soft contact shadow under the subject)
+      4. that pre-filled area is refined with ComfyUI inpainting at moderate denoise so the
+         extension reads as the same cloth (falls back to the deterministic fill when ComfyUI
+         is unreachable or PIPELINE_EXPAND_GENERATIVE=0)
+      5. grain matched to the backdrop, then an edge-aware composite behind the subject/props
+
+    Returns None when no backdrop can be found (caller falls back to 'studio').
+    """
+    h, w = img.shape[:2]
+    bd = backdrop or _find_backdrop(img, alpha)
+    if bd is None:
+        return None
+    alpha = _main_subject(alpha, faces, bd)
+    # props on the backdrop (balloons...) join the subject matte so they're kept, and their
+    # own cast/contact shadows are retained like the subject's
+    props = _backdrop_props(bd)
+    if props.any():
+        n_props = cv2.connectedComponents(props.astype(np.uint8))[0] - 1
+        pm = cv2.resize(props.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+        pm = cv2.GaussianBlur(pm, (0, 0), max(1.0, max(h, w) * 0.0012))
+        alpha = np.maximum(alpha, np.clip((pm - 0.5) * 2.5 + 0.5, 0, 1))
+        log.info("expand: keeping %d prop(s) on the backdrop", n_props)
+    # parts attached to the subject/props that the matte missed and that differ strongly in
+    # tone from the cloth — the silver body of a foil balloon, a real contact shadow right
+    # under a balloon — are kept as shot too (flattening them erases part of a prop)
+    got = _backdrop_surface(bd)
+    if got is not None:
+        attached = _attached_objects(bd, got[0], np.maximum(alpha, 0.0))
+        if attached.any():
+            am = cv2.resize(attached.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+            am = cv2.GaussianBlur(am, (0, 0), max(1.0, max(h, w) * 0.0015))
+            alpha = np.maximum(alpha, np.clip((am - 0.5) * 2.0 + 0.5, 0, 1))
+    bd = _find_backdrop(img, alpha) or bd
+    region, small, a_s, subject = bd.region, bd.small, bd.alpha, bd.subject
+    sh, sw = region.shape
+    long_s = max(sw, sh)
+    lab = cv2.cvtColor(small, cv2.COLOR_RGB2Lab)
+
+    got = _backdrop_surface(bd)
+    if got is None:
+        return None
+    surf, samp = got
+
+    # 3a. real cast shadow: broad (wrinkle-free) darkening of the cloth close to the subject
+    cloth = _fill_holes(cv2.morphologyEx(region.astype(np.uint8), cv2.MORPH_CLOSE, _disk(15)) > 0)
+    cloth_bg = (cloth & ~subject).astype(np.float32)
+    sg = long_s * 0.02
+    l_low = (cv2.GaussianBlur(lab[..., 0] * cloth_bg, (0, 0), sg)
+             / np.maximum(cv2.GaussianBlur(cloth_bg, (0, 0), sg), 1e-3))
+    dist = cv2.distanceTransform((~subject).astype(np.uint8), cv2.DIST_L2, 5)
+    near = np.clip(1 - dist / (long_s * 0.08), 0, 1) ** 1.5
+    cloth_soft = cv2.GaussianBlur(cloth_bg, (0, 0), sg)       # feathered: no seam at the cloth edge
+    shadow = np.minimum(0.0, l_low - surf[..., 0]) * near * cloth_soft * CONFIG.expand_shadow_strength
+
+    # 3b. contact shadow under the subject's lower silhouette (feet / knees / dress hem on the
+    #     floor): the bottom edges of the matte in its lowest 30%, stronger the lower they sit
+    ys = np.nonzero(a_s > 0.5)[0]
+    top, bot = int(ys.min()), int(ys.max())
+    solid = a_s > 0.5
+    edge = solid & ~np.vstack([solid[1:], np.zeros((1, sw), bool)])     # subject pixel, air below
+    y0 = bot - 0.30 * (bot - top)
+    low = np.clip((np.arange(sh, dtype=np.float32) - y0) / max(1.0, bot - y0), 0, 1)[:, None]
+    foot = edge.astype(np.float32) * low ** 1.5
+    kk = max(3, int(long_s * 0.02))
+    contact = cv2.GaussianBlur(np.roll(foot, max(1, kk // 3), axis=0), (0, 0), sigmaX=kk * 1.2, sigmaY=kk * 0.45)
+    contact /= max(float(contact.max()), 1e-3)
+    l_med = float(np.median(surf[..., 0]))
+    shadow = np.minimum(shadow, -contact * 0.35 * l_med * CONFIG.expand_shadow_strength / 0.6)
+    surf[..., 0] += np.maximum(shadow, -0.5 * surf[..., 0])
+
+    bg = cv2.resize(cv2.cvtColor(surf.astype(np.float32), cv2.COLOR_Lab2RGB), (w, h),
+                    interpolation=cv2.INTER_CUBIC)
+
+    # 4. grain matched to the backdrop
+    grain = _backdrop_grain(img, samp, seed)
+    if grain is not None:
+        bg = bg + grain[..., None]
+
+    # the cloth cleaned in place; everything off the cloth gets the extended backdrop
+    got = _clean_backdrop(img, alpha, bd, seed, with_cloth=True, recolor=recolor)
+    if got is not None:
+        cleaned, cloth_full, cleaned_m, clean_layer = got
+        # ON the cloth: the cleaned result (pixels the layer left alone — objects, colored
+        # shadows, the subject's edge — stay as shot). OFF the cloth (walls, softbox, straps,
+        # floor): the extension, except props kept in `alpha`. Across the cloth's border, blend
+        # the layers only, so no sliver of the old cloth edge survives as a seam.
+        # holes filled first: objects ON the cloth (a hand, a balloon, the subject) are part of
+        # the core, so the blend band runs only along the cloth's OUTER border
+        solid_cloth = _fill_small_holes((cloth_full > 0.5) | (alpha > 0.5), 0.03)
+        core = cv2.erode(solid_cloth.astype(np.uint8), _disk(max(2, int(max(h, w) * 0.006))))
+        core = cv2.GaussianBlur(core.astype(np.float32), (0, 0), max(2.0, max(h, w) * 0.004))
+        layers = clean_layer * cleaned_m[..., None] + bg * (1 - cleaned_m[..., None])
+        fill = np.clip(1.0 - core, 0, 1)[..., None]
+        bg = cleaned * (1 - fill) + layers * fill
+        fill_frac = float((fill[..., 0] * (1.0 - alpha)).mean())
+        if CONFIG.expand_generative and fill_frac > 0.01:
+            bg = _refine_fill_comfy(bg, fill[..., 0] * (1.0 - (alpha > 0.5)), samp, seed)
+    log.info("expand: backdrop %.0f%% of background sampled, L=%.0f",
+             100 * samp.sum() / max(1, (~subject).sum()), l_med)
+
+    # 5. composite. Soft matte edges (hair, feathered outlines) are a mix of subject and the
+    #    OLD background: I = a*F + (1-a)*B_old.
+    #    - where the old background was the backdrop itself (≈ the new one), swap exactly:
+    #      I + (1-a)*(B_new - B_old) — fine hair strands keep their own color;
+    #    - where it was something very different and busy (a crinkled silver reflector behind
+    #      dark shoes, a wall), B_old can't be estimated reliably and the old color glows
+    #      through, so take the subject's own color from just inside the matte and tighten the
+    #      edge instead.
+    old_bg = _normalized_blur(img, alpha, max(h, w) * 0.004)
+    differs = np.clip((np.abs(old_bg - bg).mean(axis=2) - 0.015) / 0.035, 0, 1)
+    # ...or it was busy (the swap assumes a smooth old background): local texture of the
+    # old background just outside the subject
+    # (only pixels that are surely background count — hair and lace are busy themselves)
+    resid = np.abs(img - cv2.GaussianBlur(img, (0, 0), 2.0)).mean(axis=2)
+    sure_bg = cv2.erode((alpha < 0.02).astype(np.uint8), _disk(max(1, int(max(h, w) * 0.002)))
+                        ).astype(np.float32)
+    sg = max(h, w) * 0.006
+    busy = (cv2.GaussianBlur(resid * sure_bg, (0, 0), sg)
+            / np.maximum(cv2.GaussianBlur(sure_bg, (0, 0), sg), 1e-3))
+    differs = np.maximum(differs, np.clip((busy - 0.008) / 0.012, 0, 1))
+    # the matte runs a few px past hard edges (shoe heels); over a busy old background that
+    # shows as specks, so choke it there
+    choked = cv2.erode(alpha.astype(np.float32), _disk(max(1, int(max(h, w) * 0.0015))))
+    alpha = alpha * (1 - differs) + np.minimum(alpha, choked) * differs
+    differs = differs[..., None]
+    a = alpha[..., None]
+    swapped = img + (1 - a) * (bg - old_bg)
+    solid = (alpha > 0.95).astype(np.float32)
+    sg = max(1.5, max(h, w) * 0.002)
+    inner = (cv2.GaussianBlur(img * solid[..., None], (0, 0), sg)
+             / np.maximum(cv2.GaussianBlur(solid, (0, 0), sg), 1e-4)[..., None])
+    has_inner = cv2.GaussianBlur(solid, (0, 0), sg)[..., None] > 0.02
+    tight = np.clip((a - 0.3) / 0.65, 0, 1)
+    extended = np.where(has_inner, inner, img) * tight + bg * (1 - tight)
+    out = swapped * (1 - differs) + extended * differs
+    out = np.where(a > 0.95, img, np.where(a > 0.02, out, bg))
+    return np.clip(out, 0, 1)
+
+
 # named studio backdrop colors (base RGB in 0-1; a soft gradient is applied on top)
 _STUDIO_COLORS = {
     "gray": (0.56, 0.56, 0.57), "grey": (0.56, 0.56, 0.57),
@@ -1089,17 +1760,154 @@ def _studio_background(img: np.ndarray, alpha: np.ndarray, color: str = "gray") 
     return np.clip(img * a + bg * (1 - a), 0, 1)
 
 
-def _comfy_inpaint(img: np.ndarray, regen: np.ndarray, prompt: str) -> np.ndarray:
+def _reflective_floor(img: np.ndarray, alpha: np.ndarray, look: str) -> np.ndarray:
+    """Turn a crinkled silver floor (reflector panels, foil mats) into a reflective floor.
+
+    look 'water': a glossy floor with a soft rippled mirror of the backdrop and the feet.
+    look 'foil':  the same mirror, with the panels' real crinkle kept (muted) so it reads as
+    aluminum paper. The floor is found as fine-textured area joined to the bottom edge; its
+    top edge is fitted as a line (continued behind the subject). Each foot is mirrored about
+    its own contact point. Deterministic (OpenCV only); the subject itself is untouched.
+    """
+    h, w = img.shape[:2]
+    sub = alpha > 0.5
+    g = cv2.cvtColor((np.clip(img, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32)
+    hp = g - cv2.GaussianBlur(g, (0, 0), 3 * w / 2080)
+    tex = cv2.GaussianBlur(np.abs(hp), (0, 0), 12 * w / 2080)
+    near = cv2.dilate(sub.astype(np.uint8), _disk(max(3, int(0.02 * w)))) > 0
+    cand = ((tex > 2.2) & ~near).astype(np.uint8)
+    cand[: int(0.6 * h)] = 0
+    cand = cv2.morphologyEx(cand, cv2.MORPH_OPEN, _disk(max(2, int(0.008 * w))))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(cand)
+    keep = [i for i in range(1, n) if st[i, 1] + st[i, 3] >= h - 5 and st[i, 4] > 0.01 * h * w]
+    if not keep:
+        log.warning("floor: no textured floor (reflector/foil) found at the bottom — skipped")
+        return img
+    ref = np.isin(lab, keep)
+    cols = np.where(ref.any(0))[0]
+    tops = ref[:, cols].argmax(0).astype(np.float64)
+    run = np.array([ref[int(t):, c].mean() for t, c in zip(tops, cols)])
+    cols, tops = cols[run > 0.9], tops[run > 0.9]           # floor runs down to the bottom
+    if len(cols) < 0.1 * w:
+        log.warning("floor: floor edge too short to fit — skipped")
+        return img
+    # top edge: robust line fit, nudged up to the upper envelope so no foil peeks above it
+    x = cols.astype(np.float64)
+    wgt = np.ones_like(x)
+    for _ in range(5):
+        p = np.polyfit(x, tops, 1, w=wgt)
+        r = tops - np.polyval(p, x)
+        s = 1.4826 * np.median(np.abs(r)) + 1
+        wgt = (np.abs(r) < 2.5 * s).astype(float) + 1e-3
+    top = (np.polyval(p, np.arange(w)) - np.percentile(r[wgt > 0.5], 90)
+           - 0.004 * h).astype(np.float32)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    feather = max(2.0, 8 * h / 2080)
+    floor = np.clip((yy - top[None, :] + feather) / (2 * feather), 0, 1)
+    # the backdrop just above the floor edge is what the floor mirrors (subject columns
+    # interpolated from their neighbours)
+    band = np.clip(top.astype(int) - int(0.02 * h), 0, h - 1)
+    col = img[band, np.arange(w)]
+    okc = ~sub[band, np.arange(w)]
+    if okc.sum() < 2:
+        return img
+    edge = np.stack([np.interp(np.arange(w), np.where(okc)[0], col[okc, c]) for c in range(3)],
+                    axis=-1).astype(np.float32)
+    edge = cv2.GaussianBlur(edge[None], (0, 0), 0.02 * w)[0]
+    bg_ref = np.broadcast_to(edge[None], img.shape).astype(np.float32)
+    # mirror axis: the nearest foot's contact point (bottom of the matte), never above the edge
+    bot = np.where(sub.any(0), h - 1 - sub[::-1].argmax(0), 0).astype(np.float32)
+    axis = cv2.dilate(bot.reshape(1, -1), np.ones((1, max(3, int(0.12 * w))), np.uint8)).ravel()
+    axis = np.maximum(axis, top)
+    axis = cv2.GaussianBlur(axis.reshape(1, -1), (0, 0), 0.02 * w).ravel()
+
+    water = look == "water"
+    d = np.clip(yy - top[None, :], 0, None)
+    dx = np.zeros_like(xx)
+    dy = np.zeros_like(yy)
+    if water:
+        rng = np.random.default_rng(3)
+        noise = cv2.GaussianBlur(rng.standard_normal((h, w)).astype(np.float32), (0, 0), 18 * w / 2080)
+        noise /= noise.std() + 1e-6
+        amp = (1.5 * w / 2080) + 0.03 * d                   # ripples grow away from the feet
+        dx = amp * np.sin(yy * (2 * np.pi / (12 * w / 2080 + 0.03 * d)) + 3 * noise)
+        dy = 0.3 * amp * noise
+    sy = np.clip(2 * axis[None, :] - yy + dy, 0, h - 1)
+    sx = np.clip(xx + dx, 0, w - 1)
+    s_img = cv2.remap(img.astype(np.float32), sx, sy, cv2.INTER_LINEAR)
+    s_a = cv2.remap(alpha.astype(np.float32), sx, sy, cv2.INTER_LINEAR)
+    s_a *= (yy > axis[None, :] - 2)
+    m = bg_ref * (1 - s_a[..., None]) + s_a[..., None] * s_img
+    k = np.clip(d / (0.12 * h), 0, 1)[..., None]            # blurrier further from the feet
+    m = m * (1 - k) + cv2.GaussianBlur(m, (0, 0), (5 if water else 3) * w / 2080) * k
+    fade = np.exp(-d / (0.25 * h))[..., None]               # reflection fades toward camera
+    base = bg_ref * 0.97
+    if water:
+        s = 0.7 * fade + 0.2
+        f = (base * (1 - s) + m * s) * np.array([0.94, 0.97, 1.03], np.float32)
+        rng = np.random.default_rng(5)
+        gl = cv2.GaussianBlur(rng.random((h, w)).astype(np.float32), (0, 0), 2.5)
+        gl = cv2.GaussianBlur(np.clip((gl - 0.53) * 10, 0, 1), (81, 3), 0)[..., None]
+        f = f + 0.07 * gl * (1 - fade * 0.5)                # glossy streaks
+    else:
+        s = 0.55 * fade + 0.15
+        f = (base * (1 - s) + m * s) * np.array([0.97, 0.99, 1.02], np.float32)
+        f = f + 1.1 * (hp / 255.0)[..., None]               # the real foil crinkle, muted
+    km = _apply_layer_edit("floor", floor * (1 - np.clip(alpha, 0, 1)))[..., None]
+    log.info("floor: %s reflection over %.0f%% of the frame", look, 100 * float(floor.mean()))
+    return np.clip(img * (1 - km) + np.clip(f, 0, 1) * km, 0, 1).astype(img.dtype)
+
+
+_COMFY_ENGINE: str | None = None
+
+
+def _comfy_engine() -> str:
+    """'flux' when ComfyUI can run FLUX.1 Fill (GGUF loader node + model files present),
+    else 'sd15'. COMFYUI_ENGINE=flux|sd15 forces it. Only 'flux' is cached, so models added
+    while a long-running process is up are picked up on the next inpaint."""
+    global _COMFY_ENGINE
+    if CONFIG.comfyui_engine in ("flux", "sd15"):
+        return CONFIG.comfyui_engine
+    if _COMFY_ENGINE is None:
+        import httpx
+        engine = "sd15"
+        try:
+            base = CONFIG.comfyui_url
+            unets = httpx.get(f"{base}/object_info/UnetLoaderGGUF", timeout=5).json()
+            names = unets["UnetLoaderGGUF"]["input"]["required"]["unet_name"][0]
+            clips = httpx.get(f"{base}/object_info/DualCLIPLoader", timeout=5).json()
+            t5s = clips["DualCLIPLoader"]["input"]["required"]["clip_name1"][0]
+            vaes = httpx.get(f"{base}/object_info/VAELoader", timeout=5).json()
+            vae_names = vaes["VAELoader"]["input"]["required"]["vae_name"][0]
+            if (CONFIG.comfyui_flux_unet in names and CONFIG.comfyui_flux_t5 in t5s
+                    and "clip_l.safetensors" in t5s and "ae.safetensors" in vae_names):
+                engine = "flux"
+        except Exception as exc:   # node not installed / ComfyUI down: SD1.5 path reports it
+            log.debug("FLUX engine probe failed: %s", exc)
+        if engine == "flux":
+            _COMFY_ENGINE = engine
+        log.info("ComfyUI inpaint engine: %s", engine)
+        return engine
+    return _COMFY_ENGINE
+
+
+def _comfy_inpaint(img: np.ndarray, regen: np.ndarray, prompt: str,
+                  denoise: float = 1.0) -> np.ndarray:
     """Regenerate the regions where `regen` (float 0..1, 1 = regenerate) is set, via
     ComfyUI inpainting, and return the full-size result image. The caller decides how
     to composite it (background replace keeps the subject; erase keeps everything
-    outside the drawn mask)."""
+    outside the drawn mask). denoise < 1 refines what is already there (the masked area
+    is pre-filled by the caller) instead of generating from scratch."""
     import httpx
 
-    workflow = json.loads((_WORKFLOW_DIR / "inpaint.json").read_text())["nodes"]
+    flux = _comfy_engine() == "flux"
+    workflow = json.loads((_WORKFLOW_DIR / ("inpaint_flux.json" if flux else "inpaint.json"))
+                          .read_text())["nodes"]
 
     h, w = img.shape[:2]
-    scale = min(1.0, 1024 / max(h, w))
+    # FLUX crops the mask + context from the full-res frame itself (crop-and-stitch), so it
+    # gets the photo at full size; SD1.5 samples the whole frame, so it gets a downscale
+    scale = min(1.0, (4096 if flux else 1024) / max(h, w))
     sw, sh = int(w * scale) // 8 * 8, int(h * scale) // 8 * 8
     small = cv2.resize(img, (sw, sh), interpolation=cv2.INTER_AREA)
     small_mask = cv2.resize(regen, (sw, sh), interpolation=cv2.INTER_LINEAR)
@@ -1130,17 +1938,22 @@ def _comfy_inpaint(img: np.ndarray, regen: np.ndarray, prompt: str) -> np.ndarra
 
         workflow["1"]["inputs"]["image"] = upload(img_path)
         workflow["2"]["inputs"]["image"] = upload(mask_path)
-        workflow["6"]["inputs"]["denoise"] = 1.0
+        workflow["6"]["inputs"]["denoise"] = float(denoise)
         workflow["6"]["inputs"]["seed"] = int(time.time())
-        workflow["7"]["inputs"]["ckpt_name"] = CONFIG.comfyui_checkpoint
         workflow["8"]["inputs"]["text"] = f"{prompt}, photorealistic, natural lighting, high quality photo"
+        if flux:
+            workflow["20"]["inputs"]["unet_name"] = CONFIG.comfyui_flux_unet
+            workflow["21"]["inputs"]["clip_name1"] = CONFIG.comfyui_flux_t5
+        else:
+            workflow["7"]["inputs"]["ckpt_name"] = CONFIG.comfyui_checkpoint
 
         resp = client.post(f"{base}/prompt",
                            json={"prompt": workflow, "client_id": f"pipeline-{uuid.uuid4().hex[:8]}"},
                            timeout=30)
         resp.raise_for_status()
         prompt_id = resp.json()["prompt_id"]
-        log.info("Generative inpaint submitted (prompt_id=%s)", prompt_id)
+        log.info("Generative inpaint submitted (%s, prompt_id=%s)",
+                 "FLUX.1 Fill" if flux else "SD1.5", prompt_id)
 
         deadline = time.time() + CONFIG.comfyui_timeout
         history = None
@@ -1181,6 +1994,72 @@ def _replace_background_comfy(img: np.ndarray, alpha: np.ndarray, prompt: str) -
 
 
 # ------------------------------------------------------------------ object erase
+
+# Background layers made automatically (the backdrop clean layer, the reflective floor) are
+# saved per photo as data/masks/<id>.<layer>.png so the web UI can show them; an operator's
+# correction <id>.<layer>.edit.png (gray = auto, white = add, black = remove) is applied on
+# every render. _LAYER_ID is the photo being rendered (None: layers are neither saved nor edited).
+_LAYER_ID: str | None = None
+LAYERS = ("backdrop", "floor")
+# the area just filled by the operator's erase in this render: the automatic background layers
+# must not re-process what the operator deliberately repainted (e.g. a generated floor)
+_ERASED: np.ndarray | None = None
+
+
+def layer_path(photo_id, layer: str, edit: bool = False) -> Path:
+    return CONFIG.root / "masks" / f"{photo_id}.{layer}{'.edit' if edit else ''}.png"
+
+
+def _layer_edit(layer: str, shape: tuple) -> tuple[np.ndarray, np.ndarray] | None:
+    """(add, remove) 0-1 maps from the operator's edit of this layer (plus, for the
+    backdrop layer, the area erased in this render), or None."""
+    add = rem = None
+    path = layer_path(_LAYER_ID, layer, edit=True) if _LAYER_ID is not None else None
+    if path is not None and not path.exists():
+        from .storage import STORAGE
+        if STORAGE.get(path) is None:
+            path = None
+    if path is not None:
+        e = np.array(Image.open(path).convert("L")).astype(np.float32) / 255.0
+        e = cv2.resize(e, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
+        add = np.clip((e - 0.5) * 2, 0, 1)
+        rem = np.clip((0.5 - e) * 2, 0, 1)
+    if layer == "backdrop" and _ERASED is not None:
+        er = cv2.resize(_ERASED.astype(np.float32), (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
+        rem = er if rem is None else np.maximum(rem, er)
+        add = np.zeros_like(rem) if add is None else add * (1.0 - er)
+    if add is None or (add.max() < 0.05 and rem.max() < 0.05):
+        return None
+    log.info("%s layer: operator edit applied (+%.1f%% / -%.1f%% of the frame)", layer,
+             100 * float((add > 0.5).mean()), 100 * float((rem > 0.5).mean()))
+    return add, rem
+
+
+def _apply_layer_edit(layer: str, m: np.ndarray) -> np.ndarray:
+    """Apply the operator's edit to a layer's opacity (full-res 0-1) and save the result."""
+    ed = _layer_edit(layer, m.shape)
+    if ed is not None:
+        add, rem = ed
+        m = np.maximum(m * (1.0 - rem), add)
+    _save_layer(layer, m)
+    return m
+
+
+def _save_layer(layer: str, m: np.ndarray) -> None:
+    if _LAYER_ID is None:
+        return
+    try:
+        path = layer_path(_LAYER_ID, layer)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        h, w = m.shape
+        s = min(1.0, 1600 / max(h, w))
+        small = cv2.resize(m.astype(np.float32), (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+        Image.fromarray((np.clip(small, 0, 1) * 255).astype(np.uint8)).save(path)
+        from .storage import STORAGE
+        STORAGE.put(path)
+    except Exception as exc:        # the render must not fail over a preview artifact
+        log.warning("could not save the %s layer: %s", layer, exc)
+
 
 def _load_erase_mask(name: str, shape: tuple) -> np.ndarray | None:
     """Load an operator-drawn erase mask (white = remove) and fit it to the image."""
@@ -1253,10 +2132,12 @@ def _erase_regions(img: np.ndarray, mask: np.ndarray, method: str, prompt: str) 
 def _auto_background(img: np.ndarray, alpha: np.ndarray) -> tuple[str, str]:
     """Inspect the background and choose an action + color deterministically:
 
-    - a neutral studio backdrop that fills the frame but has fold wrinkles -> ('smooth', color)
-    - a neutral backdrop that only partly fills the frame (other zones visible, e.g. floor,
-      stands, wall) -> ('studio', color) so those zones are replaced with a clean backdrop
-    - anything else (a real scene, or a clean seamless backdrop) -> ('keep', color)
+    - a neutral studio backdrop that fills the frame but has wrinkles/folds/marks, or one
+      that only partly fills the frame (wall, stands, floor, reflectors visible)
+      -> ('expand', color): the cloth is cleaned in place and extended over the rest
+      (walls, stands, softboxes, floor); the subject and props on the backdrop stay
+    - anything else (a real scene, a clean seamless backdrop, or a near-black background —
+      night scenes look like a black backdrop) -> ('keep', color)
 
     color is the backdrop's neutral tone: 'white', 'gray' or 'black' from its median lightness.
     """
@@ -1284,10 +2165,14 @@ def _auto_background(img: np.ndarray, alpha: np.ndarray) -> tuple[str, str]:
     detail = g - cv2.GaussianBlur(g, (0, 0), max(h, w) * 0.02)
     wrinkle = float(detail[backdrop].std()) if int(backdrop.sum()) > 100 else 0.0
 
-    if backdrop_frac > 0.90:
-        action = "smooth" if wrinkle > CONFIG.auto_bg_wrinkle_thresh else "keep"
+    if color == "black":
+        # a near-black "backdrop" is indistinguishable from a night/event scene (everything
+        # dark is neutral) — rebuilding it would erase lights, signs and guests. Manual only.
+        action = "keep"
+    elif backdrop_frac > 0.90:
+        action = "expand" if wrinkle > CONFIG.auto_bg_wrinkle_thresh else "keep"
     elif backdrop_frac > 0.50:
-        action = "studio"                       # backdrop + other zones -> unify with a studio color
+        action = "expand"                       # backdrop among other zones -> clean + extend it
     else:
         action = "keep"
     log.info("auto-bg: backdrop_frac=%.2f L=%.0f (%s) wrinkle=%.1f -> %s",
@@ -1296,16 +2181,41 @@ def _auto_background(img: np.ndarray, alpha: np.ndarray) -> tuple[str, str]:
 
 
 def _apply_background(img: np.ndarray, action: str, prompt: str,
-                      alpha: np.ndarray | None, color: str = "gray") -> np.ndarray:
+                      alpha: np.ndarray | None, color: str = "gray",
+                      faces: list | None = None, backdrop_color: str = "auto") -> np.ndarray:
     if action == "keep":
         return img
     if alpha is None or alpha.max() < 0.05 or alpha.mean() > 0.95:
         log.warning("No usable subject mask — leaving background unchanged")
         return img
-    if action == "auto":
+    auto = action == "auto"
+    if auto:
         action, color = _auto_background(img, alpha)
         if action == "keep":
             return img
+    if action in ("clean", "expand"):
+        bd = _find_backdrop(img, alpha)
+        if auto and (bd is None or bd.region.sum() < 0.30 * max(1, (~bd.subject).sum())
+                     or bd.ring_frac < 0.75 or bd.clipped_frac > 0.10):
+            # neutral-ish background but no single backdrop cloth all around the subject
+            # (white walls at home, a gray venue), or a blown-out sky/window posing as a white
+            # backdrop (real studio backdrops measured 0% clipped) — auto never rebuilds that
+            log.info("auto-bg: no coherent backdrop behind the subject (ring %.0f%%, clipped "
+                     "%.0f%%) -> keep", 100 * (bd.ring_frac if bd else 0),
+                     100 * (bd.clipped_frac if bd else 0))
+            return img
+        recolor = None if (backdrop_color or "auto").lower() == "auto" else backdrop_color
+        if action == "clean":
+            out = _clean_backdrop(img, alpha, bd, recolor=recolor) if bd is not None else None
+            if out is None:
+                log.warning("clean: no backdrop found — leaving the background unchanged")
+                return img
+            return out
+        out = _expand_backdrop(img, alpha, faces, bd, recolor=recolor) if bd is not None else None
+        if out is not None:
+            return out
+        log.warning("expand: no backdrop found — using a %s studio backdrop instead", color)
+        return _studio_background(img, alpha, color)
     if action == "blur":
         return _blur_background(img, alpha)
     if action == "smooth":
@@ -1324,9 +2234,23 @@ def _apply_background(img: np.ndarray, action: str, prompt: str,
 
 # -------------------------------------------------------------------- entry point
 
-def retouch(tiff_path: Path, analysis_json: str) -> Path:
+def retouch(tiff_path: Path, analysis_json: str, photo_id: int | None = None) -> Path:
     """Run Stages 5-6. Returns the retouched image path, or the input path
-    unchanged when there is nothing to do."""
+    unchanged when there is nothing to do. photo_id enables saving the automatic background
+    layers and applying the operator's layer edits (see layer_path)."""
+    global _LAYER_ID, _ERASED
+    _LAYER_ID = None if photo_id is None else str(photo_id)
+    _ERASED = None
+    if _LAYER_ID is not None:      # the layers this render makes replace the previous ones
+        for layer in LAYERS:
+            layer_path(_LAYER_ID, layer).unlink(missing_ok=True)
+    try:
+        return _retouch(tiff_path, analysis_json)
+    finally:
+        _LAYER_ID = _ERASED = None
+
+
+def _retouch(tiff_path: Path, analysis_json: str) -> Path:
     analysis = json.loads(analysis_json)
     rp = analysis.get("retouch", {})
     bg = rp.get("background", {}) or {}
@@ -1354,7 +2278,9 @@ def retouch(tiff_path: Path, analysis_json: str) -> Path:
     wants_cloth_grade = any(abs(float(clothing.get(k, 0) or 0)) > 0.01
                             for k in ("color_pop", "luminance", "shadows", "blacks", "whites"))
     wants_cloth = rp.get("clothing_contrast", 0) > 0.01 or wants_cloth_grade
-    wants_bg = bg_action != "keep"
+    floor_look = str(bg.get("floor") or "none")
+    wants_floor = floor_look in ("water", "foil")
+    wants_bg = bg_action != "keep" or wants_floor
     erase = rp.get("erase", {}) or {}
     wants_erase = bool(erase.get("mask"))
     subject_ev = float(rp.get("subject_exposure", 0.0))
@@ -1385,9 +2311,17 @@ def retouch(tiff_path: Path, analysis_json: str) -> Path:
     # cleaned frame, not the removed object
     if wants_erase:
         erase_mask = _load_erase_mask(erase.get("mask", ""), img.shape[:2])
+        if erase_mask is not None and erase.get("protect_subject"):
+            # a loose brush often clips the subject (feet on a floor being replaced): never
+            # regenerate the subject itself, only what was painted around it
+            keep = cv2.GaussianBlur((_subject_alpha(img) > 0.3).astype(np.float32), (0, 0), 2)
+            erase_mask = np.clip(erase_mask - keep, 0, 1)
+            log.info("erase: subject protected from the fill")
         if erase_mask is not None:
             img = _erase_regions(img, erase_mask, erase.get("method", "content-aware"),
                                  erase.get("prompt", ""))
+            global _ERASED
+            _ERASED = cv2.GaussianBlur((erase_mask > 0.5).astype(np.float32), (0, 0), 3)
             log.info("Erased %.1f%% of the frame (%s)", 100 * float((erase_mask > 0.5).mean()),
                      erase.get("method", "content-aware"))
 
@@ -1401,11 +2335,35 @@ def retouch(tiff_path: Path, analysis_json: str) -> Path:
     alpha = _subject_alpha(img) if (wants_bg or wants_cloth or wants_hair
                                     or wants_subject_exp or wants_bg_exp
                                     or wants_auto_subject or wants_face_work) else None
+
+    # Scope face retouch to the FIRST-PLANE subject and by gender: drop background/second-plane
+    # people entirely, then tag each kept face's gender so the women-only ops (lip enhancement,
+    # cheek blush) skip men. Everything downstream iterates `faces`, so this single filter scopes
+    # every per-face op at once.
+    female_faces = faces
+    if faces:
+        detected = len(faces)
+        faces = _foreground_faces(faces, alpha, img.shape)
+        bgr_u8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)[..., ::-1]
+        for f in faces:
+            f.gender = _classify_gender(bgr_u8, f, img.shape[:2])
+        female_faces = [f for f in faces if f.gender != "male"]
+        log.info("faces: %d detected -> %d foreground [%s]", detected, len(faces),
+                 ", ".join(f.gender for f in faces) or "none")
+
     # skin_tone = ALL skin incl. eyes/lips (tone correction reaches the whole face evenly);
     # skin = the same with eyes/lips removed, for ops that must not blur/clone those features.
     skin_tone = _skin_mask(img, faces, alpha) if faces else np.zeros(img.shape[:2], np.float32)
     skin = (np.clip(skin_tone * (1.0 - _feature_exclusion(img.shape, faces, max(f.w for f in faces))), 0, 1)
             if faces else skin_tone)
+    # skin of the women only (for the cheek-blush flush); reuse skin_tone when everyone is female
+    # so there's no extra work in the common single-subject case.
+    if not female_faces:
+        female_skin = np.zeros(img.shape[:2], np.float32)
+    elif len(female_faces) == len(faces):
+        female_skin = skin_tone
+    else:
+        female_skin = _skin_mask(img, female_faces, alpha)
 
     # exposure first (subject then background), so later ops work on corrected tones
     img = _expose_subject(img, alpha, subject_ev)
@@ -1429,13 +2387,14 @@ def retouch(tiff_path: Path, analysis_json: str) -> Path:
                                     rp.get("skin_type", "auto"),
                                     rp.get("skin_warmth", CONFIG.skin_orange_warmth),
                                     rp.get("skin_saturation", CONFIG.skin_saturation),
-                                    rp.get("skin_red", CONFIG.skin_red))
+                                    rp.get("skin_red", CONFIG.skin_red),
+                                    red_mask=female_skin)   # cheek blush: women only
         img = _brighten_skin(img, skin_tone, rp.get("skin_luminance", CONFIG.skin_luminance) * mult)
         img = _reduce_dark_circles(img, faces, rp.get("reduce_dark_circles", 0) * mult, skin)
         img = _brighten_eyes(img, faces, rp.get("brighten_eyes", 0) * mult)
         img = _iris_pop(img, faces, rp.get("iris_enhance", 0) * mult)
         img = _whiten_teeth(img, faces, rp.get("whiten_teeth", 0) * mult)
-        img = _enhance_lips(img, faces, rp.get("lip_enhance", CONFIG.lip_enhance) * mult)
+        img = _enhance_lips(img, female_faces, rp.get("lip_enhance", CONFIG.lip_enhance) * mult)  # women only
         if wants_hair or wants_cloth_grade:
             hair = _hair_mask(img, faces, alpha, skin)   # also lets clothing grade skip hair
         if wants_hair:
@@ -1452,7 +2411,9 @@ def retouch(tiff_path: Path, analysis_json: str) -> Path:
             float(clothing.get("shadows", 0) or 0), float(clothing.get("blacks", 0) or 0),
             float(clothing.get("whites", 0) or 0), mult)
     img = _apply_background(img, bg_action, bg.get("replace_prompt", ""), alpha,
-                           bg.get("color", "gray"))
+                           bg.get("color", "gray"), faces, bg.get("backdrop_color") or "auto")
+    if wants_floor and alpha is not None:
+        img = _reflective_floor(img, alpha, floor_look)
 
     dest = Path(tiff_path).with_suffix(".retouched.tiff")
     _save_tiff(img, dest)

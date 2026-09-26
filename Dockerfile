@@ -24,6 +24,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY pipeline ./pipeline
+# face-detection (YuNet) + gender-classifier (ONNX) models, loaded from /app/models by
+# pipeline.retouch. Without these, face-dependent retouch is silently disabled in the container.
+COPY models ./models
 # built SPA from stage 1 (served by pipeline.webui)
 COPY --from=web /web/dist ./web/dist
 
