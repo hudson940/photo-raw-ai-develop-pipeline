@@ -141,6 +141,9 @@ class Config:
     # When no --background is given, run 'auto' instead of 'keep': studio backdrops are
     # detected and expanded/cleaned (wrinkles, folds, shoe marks, visible studio around
     # the backdrop); real scenes resolve to keep. 0 restores the old always-keep default.
+    # camera JPGs are only published as-is (viewable/downloadable) unless this is on; a redo
+    # is what develops/retouches them
+    jpeg_auto_process: bool = os.environ.get("PIPELINE_JPEG_AUTO_PROCESS", "0") == "1"
     auto_studio_background: bool = os.environ.get("PIPELINE_AUTO_STUDIO_BG", "1").lower() in ("1", "true", "yes")
     # 'expand' backdrop rebuild: how much of the subject's real cast shadow to keep (0-1),
     # and grain matched to the backdrop (0-2).

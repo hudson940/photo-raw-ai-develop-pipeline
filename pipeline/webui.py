@@ -47,6 +47,7 @@ from . import auth, db
 from .config import CONFIG, JPEG_EXTENSIONS, SOURCE_EXTENSIONS, is_jpeg
 
 from .redo import _DEFAULT_RETOUCH, _find_raw, _process_photo, _reproduce_command
+from .jpeg_publish import publish_jpeg
 from .retouch import LAYERS, layer_path
 from .storage import STORAGE
 
@@ -1249,9 +1250,23 @@ class Handler(BaseHTTPRequestHandler):
             tmp.unlink(missing_ok=True)
             return self._error(500, f"upload failed: {exc}")
 
-        if db.enqueue(self._conn(), dest, owner):
-            log.info("Uploaded %s (owner=%s) -> queued", name, owner or "-")
-        self._json({"ok": True, "filename": name, "owner": owner, "state": "pending"}, 201)
+        conn = self._conn()
+        if not db.enqueue(conn, dest, owner):
+            return self._error(409, f"a photo named {name} already exists")
+        state = "pending"
+        if suffix in JPEG_EXTENSIONS and not CONFIG.jpeg_auto_process:
+            # a camera JPG is already a finished rendering: publish it as-is right away (the
+            # worker may not even be running); a redo is what develops/retouches it
+            row = _photo_row_by_name(conn, name)
+            try:
+                publish_jpeg(conn, row["id"])
+                state = "done"
+            except Exception as exc:
+                log.exception("Publishing uploaded JPG %s failed", name)
+                db.set_state(conn, row["id"], "failed", error=f"publish JPG: {exc}")
+                state = "failed"
+        log.info("Uploaded %s (owner=%s) -> %s", name, owner or "-", state)
+        self._json({"ok": True, "filename": name, "owner": owner, "state": state}, 201)
 
     # --- operator photo actions -----------------------------------------
 

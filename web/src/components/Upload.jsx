@@ -2,7 +2,8 @@ import React, { useRef, useState } from "react";
 import { useApp } from "../ctx.js";
 import { api } from "../api.js";
 
-// RAW files and camera JPGs both enter the pipeline (develop + retouch).
+// RAW files enter the pipeline (develop + retouch); camera JPGs are published as-is and
+// only developed/retouched when you redo them.
 const ACCEPT_EXT = /\.(cr2|cr3|nef|nrw|arw|srf|sr2|dng|raf|orf|rw2|pef|srw|3fr|erf|kdc|mos|mrw|x3f|iiq|jpe?g)$/i;
 
 export default function Upload() {
@@ -53,7 +54,7 @@ export default function Upload() {
             <div style={{ fontSize: 26 }}>⬆</div>
             <div>Drop RAW or JPG files here, or click to choose</div>
             <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
-              CR3 · NEF · ARW · DNG · RAF · JPG … enter the pipeline
+              RAW (CR3 · NEF · ARW · DNG · RAF …) is developed · JPG is published as-is — use Redo to edit it
               {app.me && app.authEnabled && !app.isSuperAdmin ? ` as your photos` : ""}.
             </div>
           </div>

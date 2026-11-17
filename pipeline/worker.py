@@ -13,7 +13,8 @@ from pathlib import Path
 
 import anthropic
 
-from .config import CONFIG
+from .config import CONFIG, is_jpeg
+from .jpeg_publish import publish_jpeg
 from . import db
 from .analysis import analyze_preview, verify_vision
 from .develop import develop, DevelopError
@@ -96,6 +97,15 @@ def process_one(conn: sqlite3.Connection, client: anthropic.Anthropic,
 
     if not raw_path.exists():
         db.set_state(conn, photo_id, "failed", error="source file disappeared from inbox")
+        return True
+
+    # camera JPGs are published as-is; only a redo develops/retouches them
+    if is_jpeg(raw_path) and row["analysis_json"] is None and not CONFIG.jpeg_auto_process:
+        try:
+            publish_jpeg(conn, photo_id)
+        except Exception as exc:
+            log.exception("Publishing JPG #%d failed", photo_id)
+            db.set_state(conn, photo_id, "failed", error=f"publish JPG: {exc}")
         return True
 
     analysis_json: str | None = None

@@ -34,8 +34,9 @@ def _to_jpeg(src: Path, dest: Path, quality: int) -> None:
         img = Image.fromarray(arr)
     else:
         img = ImageOps.exif_transpose(Image.open(src))
+    extra = {"icc_profile": img.info["icc_profile"]} if img.info.get("icc_profile") else {}
     img.convert("RGB").save(dest, "JPEG", quality=quality,
-                            subsampling=CONFIG.output_jpeg_subsampling, optimize=True)
+                            subsampling=CONFIG.output_jpeg_subsampling, optimize=True, **extra)
 
 
 def cleanup_intermediates(stem: str) -> None:
